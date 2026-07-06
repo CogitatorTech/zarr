@@ -1,7 +1,7 @@
 [project]
-name = "template-zig-project"
+name = "zarr"
 version = "0.1.0"
-description = "The Python environment for the `template-zig-project` project"
+description = "The Python environment for the Zarr project"
 
 requires-python = ">=3.10,<4.0"
 dependencies = [

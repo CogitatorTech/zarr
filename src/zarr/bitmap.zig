@@ -21,6 +21,14 @@ pub const Bitmap = struct {
         };
     }
 
+    /// Wrap an already-populated buffer as a bitmap of `bit_len` bits, taking
+    /// ownership of `buffer`. Used to rebuild a bitmap from a type-erased
+    /// validity buffer.
+    pub fn fromOwnedBuffer(buffer: Buffer, bit_len: usize) Bitmap {
+        std.debug.assert(buffer.data.len >= (bit_len + 7) / 8);
+        return .{ .buffer = buffer, .bit_len = bit_len };
+    }
+
     pub fn deinit(self: *Bitmap) void {
         self.buffer.deinit();
         self.* = undefined;
@@ -78,6 +86,17 @@ test "set, unset, and setValue" {
     try std.testing.expect(!bm.isSet(9));
     bm.setValue(1, true);
     try std.testing.expectEqual(@as(usize, 3), bm.countSet());
+}
+
+test "fromOwnedBuffer wraps an existing buffer" {
+    var buffer = try Buffer.allocZeroed(std.testing.allocator, 1);
+    buffer.data[0] = 0b0000_0101;
+    var bm = Bitmap.fromOwnedBuffer(buffer, 3);
+    defer bm.deinit();
+    try std.testing.expect(bm.isSet(0));
+    try std.testing.expect(!bm.isSet(1));
+    try std.testing.expect(bm.isSet(2));
+    try std.testing.expectEqual(@as(usize, 2), bm.countSet());
 }
 
 test "countSet masks trailing bits in the last byte" {

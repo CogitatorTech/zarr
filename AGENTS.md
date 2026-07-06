@@ -4,10 +4,10 @@ This file provides guidance to coding agents collaborating on this repository.
 
 ## Mission
 
-Zarr is a Apache Arrow implementation in Zig.
+Zarr is an Apache Arrow implementation in Zig.
 It provides Arrow-compatible columnar memory layouts, array builders, schemas, and record batches, with Arrow IPC and the Arrow C Data Interface
-planned as the library grows.
-The library is pure Zig with no dependencies; it does not wrap Arrow C++ or arrow-rs.
+(planned as the library grows).
+The library is pure Zig with no dependencies; it does not wrap Arrow C++ or Rust.
 
 Priorities, in order:
 
@@ -80,8 +80,14 @@ Where raw buffer access is intentional for performance, note it in a doc comment
 
 ### Planned Layers
 
-Memory model, arrays and builders, schema and record batches, IPC with a minimal FlatBuffers runtime, then the C Data Interface.
+Memory model, arrays and builders, schema and record batches, IPC with a minimal FlatBuffers runtime, and the C Data Interface.
 Keep new work within the current phase unless the task says otherwise; interop with pyarrow is the acceptance bar for the IPC milestone.
+
+The memory model, the array layer, schema, and record batches are in place, along with a type-erased `ArrayData` bridge (`toData`/`fromData`) that every array
+type round-trips through. The C Data Interface (`src/zarr/c_data.zig`) landed ahead of IPC, because it is self-contained and maps directly onto `ArrayData`,
+whereas IPC needs the FlatBuffers runtime. It exports and imports types, fields, arrays, and record batches. Verifying the exported bytes against an external
+implementation such as pyarrow is still pending, so treat the interface as self-consistent but not yet interop-proven. IPC remains the larger outstanding
+milestone.
 
 ## Zig Conventions
 
