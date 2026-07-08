@@ -19,7 +19,7 @@ SHELL         := /usr/bin/env bash
 # Targets
 ################################################################################
 
-.PHONY: all build rebuild test format docs docs-serve clean release help shell setup-hooks test-hooks
+.PHONY: all build rebuild test format docs docs-serve clean release help shell setup-hooks test-hooks c-api interop
 .DEFAULT_GOAL := help
 
 help: ## Show the help messages for all targets
@@ -36,6 +36,14 @@ rebuild: clean build  ## Clean and build
 test: ## Run unit tests
 	@echo "Running tests..."
 	$(ZIG) build test $(BUILD_OPTS) -j$(JOBS)
+
+c-api: ## Build the C Data Interface shared library (libzarr_c)
+	@echo "Building the C Data Interface shared library..."
+	$(ZIG) build c-api $(BUILD_OPTS) -j$(JOBS)
+
+interop: c-api ## Round-trip the C Data Interface against pyarrow (skips if pyarrow absent)
+	@echo "Running the pyarrow C Data Interface round-trip..."
+	uv run python test/interop/roundtrip.py
 
 release: ## Build in Release mode
 	@echo "Building the project in Release mode..."

@@ -4,7 +4,7 @@
 //! array standing in for a record batch, across a language boundary without
 //! copying the buffers. It defines two C structs, `ArrowSchema` and
 //! `ArrowArray`, each carrying a `release` callback that the consumer invokes to
-//! hand ownership back. This module bridges zarr's `DataType` and `ArrayData` to
+//! hand ownership back. This module bridges Zarr's `DataType` and `ArrayData` to
 //! those structs.
 //!
 //! A logical type is encoded as a compact format string: "i" for int32, "u" for
@@ -223,10 +223,17 @@ fn exportSchemaNamed(allocator: Allocator, data_type: DataType, name: ?[]const u
             c.release.?(c);
             allocator.destroy(c);
         };
+        // The C Data Interface requires non-null child names. A list's element
+        // is conventionally named "item"; a struct's fields have no names in a bare DataType,
+        // so they export empty (a named field is the way to carry struct field names).
+        const child_name: []const u8 = switch (data_type) {
+            .list => "item",
+            else => "",
+        };
         for (0..n) |i| {
             const child = try allocator.create(ArrowSchema);
             errdefer allocator.destroy(child);
-            try exportSchema(allocator, child_types[i], child);
+            try exportSchemaNamed(allocator, child_types[i], child_name, false, child);
             arr[i] = child;
             built += 1;
         }
@@ -369,7 +376,7 @@ fn releaseArray(array: *ArrowArray) callconv(.c) void {
 /// Error set for importing a foreign schema.
 pub const ImportError = error{ UnsupportedFormat, InvalidFormat } || Allocator.Error;
 
-/// Read a foreign `ArrowSchema` into an owned zarr `DataType`, recursing into
+/// Read a foreign `ArrowSchema` into an owned Zarr `DataType`, recursing into
 /// child schemas for nested types. This does not consume `schema`; the caller
 /// keeps ownership of it and remains responsible for calling its release
 /// callback. The returned type is owned by the caller and released with
@@ -383,7 +390,7 @@ pub fn importSchema(allocator: Allocator, schema: *const ArrowSchema) ImportErro
     }.f;
 
     // Timestamp carries its unit in the third character and an optional
-    // timezone after the colon, which zarr's type does not retain.
+    // timezone after the colon, which Zarr's type does not retain.
     if (fmt.len >= 4 and fmt[0] == 't' and fmt[1] == 's' and fmt[3] == ':') {
         const unit: TimeUnit = switch (fmt[2]) {
             's' => .second,
@@ -441,7 +448,7 @@ pub fn importSchema(allocator: Allocator, schema: *const ArrowSchema) ImportErro
     return error.UnsupportedFormat;
 }
 
-/// Read a foreign `ArrowSchema` into an owned zarr `Field`, taking its name
+/// Read a foreign `ArrowSchema` into an owned Zarr `Field`, taking its name
 /// from the schema name (empty when absent), its nullability from the nullable
 /// flag, and its type through `importSchema`. This does not consume `schema`;
 /// the caller keeps ownership and the release callback. The returned field is
@@ -456,7 +463,7 @@ pub fn importField(allocator: Allocator, schema: *const ArrowSchema) ImportError
     return Field{ .name = owned_name, .data_type = dt, .nullable = (schema.flags & Flags.nullable) != 0 };
 }
 
-/// Read a foreign struct `ArrowSchema` into an owned zarr `Schema`, importing
+/// Read a foreign struct `ArrowSchema` into an owned Zarr `Schema`, importing
 /// each child as a named field. The schema must have struct format ("+s"),
 /// which is how a record batch's schema is exchanged. This does not consume
 /// `c_schema`; the caller keeps ownership and the release callback. The
@@ -484,7 +491,7 @@ pub fn importSchemaFields(allocator: Allocator, c_schema: *const ArrowSchema) Im
 /// Error set for importing a foreign array.
 pub const ImportArrayError = Allocator.Error || error{ InvalidFormat, UnsupportedOffset };
 
-/// Read a foreign `ArrowArray` of logical type `data_type` into an owned zarr
+/// Read a foreign `ArrowArray` of logical type `data_type` into an owned Zarr
 /// `ArrayData`, copying every buffer. The C struct carries no buffer lengths,
 /// so each buffer's size is computed from `data_type`, the length, and, for
 /// variable-length types, the final offset. This does not consume `array`; the
