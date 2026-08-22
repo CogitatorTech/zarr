@@ -44,6 +44,8 @@ Priorities, in order:
 - `src/zarr/bitmap.zig`: `Bitmap`, the LSB-numbered validity bitmap.
 - `src/zarr/datatype.zig`: `DataType`, the Arrow logical type system.
 - `src/zarr/primitive_array.zig`: `PrimitiveArray`, a fixed-width primitive array and its builder.
+- `src/zarr/ipc/`: the Arrow IPC layer, layered as FlatBuffers runtime, message framing, schema and record batch serialization, and the stream and file formats.
+- `test/interop/`: pyarrow round-trip scripts run by `make interop`; they skip cleanly when pyarrow is absent.
 - `build.zig`: module definition, static library artifact, and the `test` and `docs` steps.
 - `build.zig.zon`: package metadata; minimum Zig version 0.16.0.
 - `Makefile`: development workflow wrapper around `zig build`.
@@ -85,10 +87,12 @@ Memory model, arrays and builders, schema and record batches, IPC with a minimal
 Keep new work within the current phase unless the task says otherwise; interop with pyarrow is the acceptance bar for the IPC milestone.
 
 The memory model, the array layer, schema, and record batches are in place, along with a type-erased `ArrayData` bridge (`toData`/`fromData`) that every array
-type round-trips through. The C Data Interface (`src/zarr/c_data.zig`) landed ahead of IPC, because it is self-contained and maps directly onto `ArrayData`,
-whereas IPC needs the FlatBuffers runtime. It exports and imports types, fields, arrays, and record batches. Verifying the exported bytes against an external
-implementation such as pyarrow is still pending, so treat the interface as self-consistent but not yet interop-proven. IPC remains the larger outstanding
-milestone.
+type round-trips through. The C Data Interface (`src/zarr/c_data.zig`) exports and imports types, fields, arrays, and record batches. IPC is in place under
+`src/zarr/ipc/`: a minimal FlatBuffers runtime, message framing, schema and record batch serialization, and the stream and file formats. Both the C Data
+Interface and IPC are interop-proven against pyarrow in both directions. `make interop` runs the scripts under `test/interop/`, and fixture tests inside the
+IPC modules pin pyarrow-written bytes without a network or Python dependency. Not yet implemented: dictionary batches, body compression, and the spec types
+missing from `DataType`, such as decimal, time, duration, interval, fixed-size layouts, map, and union. Readers report these as unsupported errors instead of
+guessing.
 
 ## Zig Conventions
 
