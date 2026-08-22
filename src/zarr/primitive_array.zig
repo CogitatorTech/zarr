@@ -314,7 +314,7 @@ test "primitive array round-trips through type-erased array data" {
 
 test "fromData preserves a temporal logical type" {
     const allocator = std.testing.allocator;
-    var builder = PrimitiveArray(i64).Builder.initWithType(allocator, .{ .timestamp = .microsecond });
+    var builder = PrimitiveArray(i64).Builder.initWithType(allocator, .{ .timestamp = .{ .unit = .microsecond } });
     defer builder.deinit();
     try builder.append(1_700_000_000_000_000);
     var array = try builder.finish();
@@ -326,7 +326,7 @@ test "fromData preserves a temporal logical type" {
     var rebuilt = try PrimitiveArray(i64).fromData(allocator, data);
     defer rebuilt.deinit();
 
-    try std.testing.expectEqual(DataType{ .timestamp = .microsecond }, rebuilt.dataType());
+    try std.testing.expectEqual(DataType{ .timestamp = .{ .unit = .microsecond } }, rebuilt.dataType());
     try std.testing.expectEqual(@as(?i64, 1_700_000_000_000_000), rebuilt.get(0));
 }
 
@@ -389,14 +389,14 @@ test "date32 array carries a temporal logical type over i32 storage" {
 }
 
 test "timestamp array carries its time unit over i64 storage" {
-    var builder = PrimitiveArray(i64).Builder.initWithType(std.testing.allocator, .{ .timestamp = .microsecond });
+    var builder = PrimitiveArray(i64).Builder.initWithType(std.testing.allocator, .{ .timestamp = .{ .unit = .microsecond } });
     defer builder.deinit();
     try builder.append(1_700_000_000_000_000);
 
     var array = try builder.finish();
     defer array.deinit();
 
-    try std.testing.expectEqual(DataType{ .timestamp = .microsecond }, array.dataType());
+    try std.testing.expectEqual(DataType{ .timestamp = .{ .unit = .microsecond } }, array.dataType());
     try std.testing.expectEqual(@as(?i64, 1_700_000_000_000_000), array.get(0));
 }
 
