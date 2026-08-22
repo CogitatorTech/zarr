@@ -118,6 +118,7 @@ Run the narrowest relevant checks, then expand if the change is wide.
 | Docs       | `make docs`                                   | Public API doc comments changed        |
 | Corpus     | `make corpus`                                 | IPC decode paths changed (optional; skips without the arrow-testing submodule) |
 | Differential | `make interop-nanoarrow`                    | IPC read or write paths changed (optional; skips without the nanoarrow submodule) |
+| Golden     | `make golden`                                 | IPC decode paths or `DataType` changed (optional; skips without the arrow-testing submodule) |
 
 Minimum expectations:
 

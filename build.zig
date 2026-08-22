@@ -59,6 +59,24 @@ pub fn build(b: *std.Build) void {
     const corpus_step = b.step("corpus-check", "Run the arrow-testing IPC fuzz corpus through the IPC readers");
     corpus_step.dependOn(&run_corpus.step);
 
+    // Golden-file check against the Arrow integration data in the optional
+    // arrow-testing submodule, run on demand via `zig build golden-check`.
+    // The tool skips and exits zero when the submodule is not initialized.
+    const golden_module = b.createModule(.{
+        .root_source_file = b.path("tools/golden_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    golden_module.addImport("zarr", zarr_module);
+    const golden_exe = b.addExecutable(.{
+        .name = "golden-check",
+        .root_module = golden_module,
+    });
+    const run_golden = b.addRunArtifact(golden_exe);
+    run_golden.setCwd(b.path("."));
+    const golden_step = b.step("golden-check", "Verify the Arrow integration golden files against their JSON values");
+    golden_step.dependOn(&run_golden.step);
+
     // Differential IPC test against nanoarrow, run on demand via
     // `zig build interop-nanoarrow`. Compiles the vendored nanoarrow sources
     // from the external/nanoarrow submodule with Zig's C compiler, so no
