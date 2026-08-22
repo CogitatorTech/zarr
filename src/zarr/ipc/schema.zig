@@ -86,33 +86,31 @@ pub fn writeSchema(b: *Builder, schema: Schema) Allocator.Error!Offset {
     return b.endTable();
 }
 
-/// Writes one `Field` table and returns its offset. A list's element child is
-/// conventionally named "item"; a struct's children have no names in a bare
-/// `DataType` and are written unnamed, matching the C Data Interface export.
-/// Child nullability is not part of `DataType` either, so children are written
-/// as nullable, which permits any child data.
+/// Writes one `Field` table and returns its offset. Child names and
+/// nullability come from the child fields nested types carry, so struct
+/// field names and list element names round-trip.
 fn writeField(b: *Builder, name: []const u8, data_type: DataType, nullable: bool) Allocator.Error!Offset {
     var children_off: Offset = 0;
     switch (data_type) {
         .list => |child| {
-            const item = try writeField(b, "item", child.*, true);
+            const item = try writeField(b, child.name, child.data_type, child.nullable);
             try b.startVector(4, 1, 4);
             try b.pushOffsetElement(item);
             children_off = try b.endVector(1);
         },
-        .@"struct" => |children| {
-            const offsets = try b.allocator.alloc(Offset, children.len);
+        .@"struct" => |fields| {
+            const offsets = try b.allocator.alloc(Offset, fields.len);
             defer b.allocator.free(offsets);
-            for (children, 0..) |child, i| {
-                offsets[i] = try writeField(b, "", child, true);
+            for (fields, 0..) |field, i| {
+                offsets[i] = try writeField(b, field.name, field.data_type, field.nullable);
             }
-            try b.startVector(4, children.len, 4);
-            var i = children.len;
+            try b.startVector(4, fields.len, 4);
+            var i = fields.len;
             while (i > 0) {
                 i -= 1;
                 try b.pushOffsetElement(offsets[i]);
             }
-            children_off = try b.endVector(children.len);
+            children_off = try b.endVector(fields.len);
         },
         else => {},
     }
@@ -216,16 +214,19 @@ pub fn readSchema(allocator: Allocator, table: Table) DecodeError!Schema {
         allocator.free(fields);
     }
     for (0..n) |i| {
-        fields[i] = try readField(allocator, try table.vectorTable(schema_slot_fields, i));
+        fields[i] = try readField(allocator, try table.vectorTable(schema_slot_fields, i), 0);
         finished += 1;
     }
     return .{ .fields = fields };
 }
 
-/// Reads one `Field` table into an owned `Field`. A field with no name gets
-/// an empty one, since `Field.name` is not optional.
-fn readField(allocator: Allocator, table: Table) DecodeError!Field {
-    var data_type = try readType(allocator, table, 0);
+/// Reads one `Field` table into an owned `Field`, recursing through `readType`
+/// into child fields. A field with no name gets an empty one, since
+/// `Field.name` is not optional. `depth` bounds the recursion; see
+/// `max_type_nesting`.
+fn readField(allocator: Allocator, table: Table, depth: usize) DecodeError!Field {
+    if (depth > max_type_nesting) return error.MalformedSchema;
+    var data_type = try readType(allocator, table, depth);
     errdefer data_type.deinit(allocator);
     // All fallible reads happen before the name is duped, so nothing leaks
     // when one of them fails.
@@ -235,16 +236,16 @@ fn readField(allocator: Allocator, table: Table) DecodeError!Field {
     return .{ .name = name, .data_type = data_type, .nullable = nullable };
 }
 
-/// Nesting bound for `readType`. A hostile buffer can point a field's child
+/// Nesting bound for `readField`. A hostile buffer can point a field's child
 /// at the field itself, which would recurse forever; real schemas stay far
 /// below this depth.
 const max_type_nesting = 64;
 
 /// Reads the `Type` union of a `Field` table, recursing into the field's
 /// children for list and struct. The nested type's `Type` members carry no
-/// child information themselves; children live on the enclosing field.
+/// child information themselves; children live on the enclosing field and
+/// are read as full fields, keeping their names and nullability.
 fn readType(allocator: Allocator, field_table: Table, depth: usize) DecodeError!DataType {
-    if (depth > max_type_nesting) return error.MalformedSchema;
     switch (try field_table.readScalar(u8, field_slot_type_tag, 0)) {
         type_null => return .null,
         type_bool => return .boolean,
@@ -302,24 +303,24 @@ fn readType(allocator: Allocator, field_table: Table, depth: usize) DecodeError!
         },
         type_list => {
             if (try field_table.vectorLen(field_slot_children) != 1) return error.MalformedSchema;
-            const child = try allocator.create(DataType);
+            const child = try allocator.create(Field);
             errdefer allocator.destroy(child);
-            child.* = try readType(allocator, try field_table.vectorTable(field_slot_children, 0), depth + 1);
+            child.* = try readField(allocator, try field_table.vectorTable(field_slot_children, 0), depth + 1);
             return .{ .list = child };
         },
         type_struct => {
             const n = try field_table.vectorLen(field_slot_children);
-            const children = try allocator.alloc(DataType, n);
+            const fields = try allocator.alloc(Field, n);
             var finished: usize = 0;
             errdefer {
-                for (children[0..finished]) |*c| c.deinit(allocator);
-                allocator.free(children);
+                for (fields[0..finished]) |*f| f.deinit(allocator);
+                allocator.free(fields);
             }
             for (0..n) |i| {
-                children[i] = try readType(allocator, try field_table.vectorTable(field_slot_children, i), depth + 1);
+                fields[i] = try readField(allocator, try field_table.vectorTable(field_slot_children, i), depth + 1);
                 finished += 1;
             }
-            return .{ .@"struct" = children };
+            return .{ .@"struct" = fields };
         },
         else => return error.UnsupportedType,
     }
@@ -412,6 +413,43 @@ test "nested list and struct types round-trip" {
     try testing.expect(schema.equals(back));
 }
 
+test "named struct fields and list child fields round-trip" {
+    const allocator = testing.allocator;
+
+    var x = try Field.init(allocator, "x", .float64, false);
+    defer x.deinit(allocator);
+    var label = try Field.init(allocator, "label", .utf8, true);
+    defer label.deinit(allocator);
+    var point_type = try DataType.initStructFields(allocator, &.{ x, label });
+    defer point_type.deinit(allocator);
+
+    var element = try Field.init(allocator, "element", .int64, false);
+    defer element.deinit(allocator);
+    var readings_type = try DataType.initListField(allocator, element);
+    defer readings_type.deinit(allocator);
+
+    var point = try Field.init(allocator, "point", point_type, true);
+    defer point.deinit(allocator);
+    var readings = try Field.init(allocator, "readings", readings_type, false);
+    defer readings.deinit(allocator);
+    var schema = try Schema.init(allocator, &.{ point, readings });
+    defer schema.deinit(allocator);
+
+    const bytes = try encode(allocator, schema);
+    defer allocator.free(bytes);
+    var back = try decode(allocator, bytes);
+    defer back.deinit(allocator);
+
+    try testing.expect(schema.equals(back));
+    const point_back = back.field(0).data_type.@"struct";
+    try testing.expectEqualStrings("x", point_back[0].name);
+    try testing.expect(!point_back[0].nullable);
+    try testing.expectEqualStrings("label", point_back[1].name);
+    const element_back = back.field(1).data_type.list;
+    try testing.expectEqualStrings("element", element_back.name);
+    try testing.expect(!element_back.nullable);
+}
+
 test "empty schema round-trips" {
     var schema = try Schema.init(testing.allocator, &.{});
     defer schema.deinit(testing.allocator);
@@ -483,7 +521,7 @@ test "decode reads a schema serialized by pyarrow" {
 
     try testing.expectEqualStrings("tags", schema.field(3).name);
     try testing.expect(schema.field(3).data_type == .list);
-    try testing.expect(schema.field(3).data_type.list.equals(.int64));
+    try testing.expect(schema.field(3).data_type.list.data_type.equals(.int64));
 }
 
 test "decode rejects a big-endian schema" {

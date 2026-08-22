@@ -167,9 +167,9 @@ fn copyBuffers(data: ArrayData, body: []u8, pos: *u64) void {
 fn countNodes(data_type: DataType) usize {
     var n: usize = 1;
     switch (data_type) {
-        .list => |child| n += countNodes(child.*),
-        .@"struct" => |children| for (children) |child| {
-            n += countNodes(child);
+        .list => |child| n += countNodes(child.data_type),
+        .@"struct" => |fields| for (fields) |field| {
+            n += countNodes(field.data_type);
         },
         else => {},
     }
@@ -180,9 +180,9 @@ fn countNodes(data_type: DataType) usize {
 fn countBuffers(data_type: DataType) usize {
     var n = ArrayData.bufferCount(data_type);
     switch (data_type) {
-        .list => |child| n += countBuffers(child.*),
-        .@"struct" => |children| for (children) |child| {
-            n += countBuffers(child);
+        .list => |child| n += countBuffers(child.data_type),
+        .@"struct" => |fields| for (fields) |field| {
+            n += countBuffers(field.data_type);
         },
         else => {},
     }
@@ -202,12 +202,12 @@ pub fn readRecordBatch(allocator: Allocator, table: Table, data_type: DataType, 
     const length = try table.readScalar(i64, batch_slot_length, 0);
     if (length < 0) return error.MalformedBatch;
 
-    const column_types = data_type.@"struct";
+    const column_fields = data_type.@"struct";
     var expected_nodes: usize = 0;
     var expected_buffers: usize = 0;
-    for (column_types) |column_type| {
-        expected_nodes += countNodes(column_type);
-        expected_buffers += countBuffers(column_type);
+    for (column_fields) |column_field| {
+        expected_nodes += countNodes(column_field.data_type);
+        expected_buffers += countBuffers(column_field.data_type);
     }
     if (try table.vectorLen(batch_slot_nodes) != expected_nodes) return error.MalformedBatch;
     if (try table.vectorLen(batch_slot_buffers) != expected_buffers) return error.MalformedBatch;
@@ -218,14 +218,14 @@ pub fn readRecordBatch(allocator: Allocator, table: Table, data_type: DataType, 
     var result = blk: {
         var node_i: usize = 0;
         var buffer_i: usize = 0;
-        const children = try allocator.alloc(ArrayData, column_types.len);
+        const children = try allocator.alloc(ArrayData, column_fields.len);
         var finished: usize = 0;
         errdefer {
             for (children[0..finished]) |*child| child.deinit();
             allocator.free(children);
         }
-        for (column_types, 0..) |column_type, i| {
-            children[i] = try readColumn(allocator, table, column_type, body, &node_i, &buffer_i);
+        for (column_fields, 0..) |column_field, i| {
+            children[i] = try readColumn(allocator, table, column_field.data_type, body, &node_i, &buffer_i);
             finished += 1;
         }
 
@@ -292,12 +292,12 @@ fn readColumn(
         allocator.free(children);
     }
     switch (data_type) {
-        .list => |child_type| {
-            children[0] = try readColumn(allocator, table, child_type.*, body, node_i, buffer_i);
+        .list => |child_field| {
+            children[0] = try readColumn(allocator, table, child_field.data_type, body, node_i, buffer_i);
             finished += 1;
         },
-        .@"struct" => |child_types| for (child_types, 0..) |child_type, i| {
-            children[i] = try readColumn(allocator, table, child_type, body, node_i, buffer_i);
+        .@"struct" => |child_fields| for (child_fields, 0..) |child_field, i| {
+            children[i] = try readColumn(allocator, table, child_field.data_type, body, node_i, buffer_i);
             finished += 1;
         },
         else => {},

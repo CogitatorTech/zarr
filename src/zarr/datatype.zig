@@ -1,8 +1,11 @@
-//! Arrow logical types.
+//! Arrow logical types and fields.
 //!
 //! Mirrors the type system in the Arrow format spec (Schema.fbs). This starts
 //! with the fixed-width primitives plus variable-length binary/utf8; nested
 //! and parameterized types are added as the corresponding array layouts land.
+//! Nested types carry their children as named `Field`s, matching Schema.fbs,
+//! where `Field` is the node holding a name, nullability, and a type. A
+//! schema is a list of the same fields; `schema.zig` builds on this.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -12,6 +15,45 @@ pub const TimeUnit = enum {
     millisecond,
     microsecond,
     nanosecond,
+};
+
+/// A named, typed, nullable column or child descriptor.
+pub const Field = struct {
+    /// Name; owned by this field.
+    name: []const u8,
+    /// Logical type; owned by this field.
+    data_type: DataType,
+    /// Whether values may be null.
+    nullable: bool,
+
+    /// Builds a field owning a copy of `name` and a deep copy of `data_type`.
+    /// The caller retains ownership of both arguments and must release the
+    /// returned field with `deinit`.
+    pub fn init(allocator: Allocator, name: []const u8, data_type: DataType, nullable: bool) Allocator.Error!Field {
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
+        const owned_type = try data_type.clone(allocator);
+        return .{ .name = owned_name, .data_type = owned_type, .nullable = nullable };
+    }
+
+    /// Frees the owned name and type.
+    pub fn deinit(self: *Field, allocator: Allocator) void {
+        allocator.free(self.name);
+        self.data_type.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Deep-copies this field.
+    pub fn clone(self: Field, allocator: Allocator) Allocator.Error!Field {
+        return init(allocator, self.name, self.data_type, self.nullable);
+    }
+
+    /// Structural equality: name, type, and nullability all match.
+    pub fn equals(self: Field, other: Field) bool {
+        return self.nullable == other.nullable and
+            std.mem.eql(u8, self.name, other.name) and
+            self.data_type.equals(other.data_type);
+    }
 };
 
 pub const DataType = union(enum) {
@@ -41,12 +83,13 @@ pub const DataType = union(enum) {
     /// Milliseconds since the UNIX epoch, stored as i64.
     date64,
     timestamp: TimeUnit,
-    /// A list of a single child element type (32-bit offsets). Owns a
-    /// heap-allocated child type; release it with `deinit`.
-    list: *const DataType,
-    /// A struct with an ordered set of child field types. Owns a
-    /// heap-allocated slice of child types; release it with `deinit`.
-    @"struct": []const DataType,
+    /// A list of a single child element field (32-bit offsets), whose name
+    /// is conventionally "item". Owns a heap-allocated child field; release
+    /// it with `deinit`.
+    list: *const Field,
+    /// A struct with an ordered set of named child fields. Owns a
+    /// heap-allocated field slice; release it with `deinit`.
+    @"struct": []const Field,
 
     /// Bit width of the value buffer for fixed-width types, null otherwise.
     pub fn bitWidth(self: DataType) ?u16 {
@@ -60,28 +103,58 @@ pub const DataType = union(enum) {
         };
     }
 
-    /// Builds a list type owning a deep copy of `child`. The caller retains
-    /// ownership of the original `child` and must release the returned type
-    /// with `deinit`.
+    /// Builds a list type from a bare element type, wrapping it in the
+    /// conventional child field: named "item" and nullable. Use
+    /// `initListField` to control the child name and nullability. The caller
+    /// retains ownership of `child` and must release the returned type with
+    /// `deinit`.
     pub fn initList(allocator: Allocator, child: DataType) Allocator.Error!DataType {
-        const owned = try allocator.create(DataType);
+        const owned = try allocator.create(Field);
         errdefer allocator.destroy(owned);
-        owned.* = try child.clone(allocator);
+        owned.* = try Field.init(allocator, "item", child, true);
         return .{ .list = owned };
     }
 
-    /// Builds a struct type owning a deep copy of `children`. The caller
-    /// retains ownership of the original `children` and must release the
-    /// returned type with `deinit`.
+    /// Builds a list type owning a deep copy of the child `field`. The caller
+    /// retains ownership of the original and must release the returned type
+    /// with `deinit`.
+    pub fn initListField(allocator: Allocator, field: Field) Allocator.Error!DataType {
+        const owned = try allocator.create(Field);
+        errdefer allocator.destroy(owned);
+        owned.* = try field.clone(allocator);
+        return .{ .list = owned };
+    }
+
+    /// Builds a struct type from bare child types, wrapping each in an
+    /// unnamed, nullable field. Use `initStructFields` to carry names. The
+    /// caller retains ownership of `children` and must release the returned
+    /// type with `deinit`.
     pub fn initStruct(allocator: Allocator, children: []const DataType) Allocator.Error!DataType {
-        const owned = try allocator.alloc(DataType, children.len);
+        const owned = try allocator.alloc(Field, children.len);
         var finished: usize = 0;
         errdefer {
-            for (owned[0..finished]) |*c| c.deinit(allocator);
+            for (owned[0..finished]) |*f| f.deinit(allocator);
             allocator.free(owned);
         }
         for (children, 0..) |child, i| {
-            owned[i] = try child.clone(allocator);
+            owned[i] = try Field.init(allocator, "", child, true);
+            finished += 1;
+        }
+        return .{ .@"struct" = owned };
+    }
+
+    /// Builds a struct type owning a deep copy of `fields`. The caller
+    /// retains ownership of the originals and must release the returned type
+    /// with `deinit`.
+    pub fn initStructFields(allocator: Allocator, fields: []const Field) Allocator.Error!DataType {
+        const owned = try allocator.alloc(Field, fields.len);
+        var finished: usize = 0;
+        errdefer {
+            for (owned[0..finished]) |*f| f.deinit(allocator);
+            allocator.free(owned);
+        }
+        for (fields, 0..) |field, i| {
+            owned[i] = try field.clone(allocator);
             finished += 1;
         }
         return .{ .@"struct" = owned };
@@ -90,8 +163,8 @@ pub const DataType = union(enum) {
     /// Deep-copies this type, including any heap-owned children.
     pub fn clone(self: DataType, allocator: Allocator) Allocator.Error!DataType {
         return switch (self) {
-            .list => |child| try initList(allocator, child.*),
-            .@"struct" => |children| try initStruct(allocator, children),
+            .list => |child| try initListField(allocator, child.*),
+            .@"struct" => |fields| try initStructFields(allocator, fields),
             else => self,
         };
     }
@@ -103,9 +176,9 @@ pub const DataType = union(enum) {
                 @constCast(child).deinit(allocator);
                 allocator.destroy(child);
             },
-            .@"struct" => |children| {
-                for (children) |*c| @constCast(c).deinit(allocator);
-                allocator.free(children);
+            .@"struct" => |fields| {
+                for (fields) |*f| @constCast(f).deinit(allocator);
+                allocator.free(fields);
             },
             else => {},
         }
@@ -118,10 +191,10 @@ pub const DataType = union(enum) {
         return switch (self) {
             .timestamp => |unit| unit == other.timestamp,
             .list => |child| child.equals(other.list.*),
-            .@"struct" => |children| blk: {
+            .@"struct" => |fields| blk: {
                 const others = other.@"struct";
-                if (children.len != others.len) break :blk false;
-                for (children, others) |a, b| {
+                if (fields.len != others.len) break :blk false;
+                for (fields, others) |a, b| {
                     if (!a.equals(b)) break :blk false;
                 }
                 break :blk true;
@@ -191,7 +264,7 @@ test "initList owns a deep copy of its child" {
     defer ty.deinit(std.testing.allocator);
 
     try std.testing.expect(ty == .list);
-    try std.testing.expect(ty.list.equals(.int32));
+    try std.testing.expect(ty.list.data_type.equals(.int32));
     try std.testing.expectEqual(@as(?u16, null), ty.bitWidth());
     try std.testing.expect(!ty.isFixedWidth());
 }
@@ -208,8 +281,8 @@ test "initList accepts a nested list child" {
     inner = .null;
 
     try std.testing.expect(outer == .list);
-    try std.testing.expect(outer.list.* == .list);
-    try std.testing.expect(outer.list.list.equals(.float64));
+    try std.testing.expect(outer.list.data_type == .list);
+    try std.testing.expect(outer.list.data_type.list.data_type.equals(.float64));
 }
 
 test "initStruct owns a deep copy of its children" {
@@ -218,8 +291,8 @@ test "initStruct owns a deep copy of its children" {
 
     try std.testing.expect(ty == .@"struct");
     try std.testing.expectEqual(@as(usize, 2), ty.@"struct".len);
-    try std.testing.expect(ty.@"struct"[0].equals(.int32));
-    try std.testing.expect(ty.@"struct"[1].equals(.utf8));
+    try std.testing.expect(ty.@"struct"[0].data_type.equals(.int32));
+    try std.testing.expect(ty.@"struct"[1].data_type.equals(.utf8));
 }
 
 test "initStruct with a nested list field" {
@@ -229,9 +302,9 @@ test "initStruct with a nested list field" {
     var ty = try DataType.initStruct(std.testing.allocator, &.{ .boolean, list_field });
     defer ty.deinit(std.testing.allocator);
 
-    try std.testing.expect(ty.@"struct"[0].equals(.boolean));
-    try std.testing.expect(ty.@"struct"[1] == .list);
-    try std.testing.expect(ty.@"struct"[1].list.equals(.int32));
+    try std.testing.expect(ty.@"struct"[0].data_type.equals(.boolean));
+    try std.testing.expect(ty.@"struct"[1].data_type == .list);
+    try std.testing.expect(ty.@"struct"[1].data_type.list.data_type.equals(.int32));
 }
 
 test "equals compares nested types by value" {
@@ -256,8 +329,8 @@ test "clone produces an independent deep copy" {
     original.deinit(std.testing.allocator);
 
     try std.testing.expect(copy == .@"struct");
-    try std.testing.expect(copy.@"struct"[0].equals(.int32));
-    try std.testing.expect(copy.@"struct"[1].equals(.utf8));
+    try std.testing.expect(copy.@"struct"[0].data_type.equals(.int32));
+    try std.testing.expect(copy.@"struct"[1].data_type.equals(.utf8));
 }
 
 test "nested type construction leaks nothing on allocation failure" {
@@ -270,4 +343,61 @@ test "nested type construction leaks nothing on allocation failure" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "initStructFields keeps names and nullability" {
+    const allocator = std.testing.allocator;
+    var x = try Field.init(allocator, "x", .int32, false);
+    defer x.deinit(allocator);
+    var y = try Field.init(allocator, "y", .utf8, true);
+    defer y.deinit(allocator);
+
+    var ty = try DataType.initStructFields(allocator, &.{ x, y });
+    defer ty.deinit(allocator);
+
+    try std.testing.expectEqualStrings("x", ty.@"struct"[0].name);
+    try std.testing.expect(!ty.@"struct"[0].nullable);
+    try std.testing.expect(ty.@"struct"[0].data_type.equals(.int32));
+    try std.testing.expectEqualStrings("y", ty.@"struct"[1].name);
+    try std.testing.expect(ty.@"struct"[1].nullable);
+}
+
+test "struct equality compares field names and nullability" {
+    const allocator = std.testing.allocator;
+    var x = try Field.init(allocator, "x", .int32, false);
+    defer x.deinit(allocator);
+    var renamed = try Field.init(allocator, "z", .int32, false);
+    defer renamed.deinit(allocator);
+
+    var a = try DataType.initStructFields(allocator, &.{x});
+    defer a.deinit(allocator);
+    var b = try DataType.initStructFields(allocator, &.{x});
+    defer b.deinit(allocator);
+    var c = try DataType.initStructFields(allocator, &.{renamed});
+    defer c.deinit(allocator);
+
+    try std.testing.expect(a.equals(b));
+    try std.testing.expect(!a.equals(c));
+}
+
+test "initList names its child field item" {
+    var ty = try DataType.initList(std.testing.allocator, .int32);
+    defer ty.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("item", ty.list.name);
+    try std.testing.expect(ty.list.nullable);
+    try std.testing.expect(ty.list.data_type.equals(.int32));
+}
+
+test "initListField keeps the given child field" {
+    const allocator = std.testing.allocator;
+    var element = try Field.init(allocator, "element", .float64, false);
+    defer element.deinit(allocator);
+
+    var ty = try DataType.initListField(allocator, element);
+    defer ty.deinit(allocator);
+
+    try std.testing.expectEqualStrings("element", ty.list.name);
+    try std.testing.expect(!ty.list.nullable);
+    try std.testing.expect(ty.list.data_type.equals(.float64));
 }

@@ -202,17 +202,17 @@ pub fn exportRecordBatch(allocator: Allocator, batch: anytype, out_schema: *Arro
 /// non-null it is duped into owned, null-terminated storage that the release
 /// callback frees; when `nullable` is true the nullable flag is set.
 fn exportSchemaNamed(allocator: Allocator, data_type: DataType, name: ?[]const u8, nullable: bool, out: *ArrowSchema) Allocator.Error!void {
-    // Determine the child types described separately from the format string.
-    var list_child: [1]DataType = undefined;
-    const child_types: []const DataType = switch (data_type) {
+    // Determine the child fields described separately from the format string.
+    var list_child: [1]Field = undefined;
+    const child_fields: []const Field = switch (data_type) {
         .list => |child| blk: {
             list_child[0] = child.*;
             break :blk list_child[0..];
         },
         .@"struct" => |fields| fields,
-        else => &[_]DataType{},
+        else => &[_]Field{},
     };
-    const n = child_types.len;
+    const n = child_fields.len;
 
     var children: ?[*]*ArrowSchema = null;
     if (n > 0) {
@@ -223,17 +223,12 @@ fn exportSchemaNamed(allocator: Allocator, data_type: DataType, name: ?[]const u
             c.release.?(c);
             allocator.destroy(c);
         };
-        // The C Data Interface requires non-null child names. A list's element
-        // is conventionally named "item"; a struct's fields have no names in a bare DataType,
-        // so they export empty (a named field is the way to carry struct field names).
-        const child_name: []const u8 = switch (data_type) {
-            .list => "item",
-            else => "",
-        };
+        // Child names and nullability come from the child fields the nested
+        // type carries.
         for (0..n) |i| {
             const child = try allocator.create(ArrowSchema);
             errdefer allocator.destroy(child);
-            try exportSchemaNamed(allocator, child_types[i], child_name, false, child);
+            try exportSchemaNamed(allocator, child_fields[i].data_type, child_fields[i].name, child_fields[i].nullable, child);
             arr[i] = child;
             built += 1;
         }
@@ -424,25 +419,25 @@ pub fn importSchema(allocator: Allocator, schema: *const ArrowSchema) ImportErro
 
     if (eq(fmt, "+l")) {
         if (schema.n_children != 1 or schema.children == null) return error.InvalidFormat;
-        var child = try importSchema(allocator, schema.children.?[0]);
+        var child = try importField(allocator, schema.children.?[0]);
         defer child.deinit(allocator);
-        return DataType.initList(allocator, child);
+        return DataType.initListField(allocator, child);
     }
 
     if (eq(fmt, "+s")) {
         if (schema.children == null and schema.n_children != 0) return error.InvalidFormat;
         const n: usize = @intCast(schema.n_children);
-        const children = try allocator.alloc(DataType, n);
+        const fields = try allocator.alloc(Field, n);
         var built: usize = 0;
         defer {
-            for (children[0..built]) |*c| c.deinit(allocator);
-            allocator.free(children);
+            for (fields[0..built]) |*f| f.deinit(allocator);
+            allocator.free(fields);
         }
         for (0..n) |i| {
-            children[i] = try importSchema(allocator, schema.children.?[i]);
+            fields[i] = try importField(allocator, schema.children.?[i]);
             built += 1;
         }
-        return DataType.initStruct(allocator, children);
+        return DataType.initStructFields(allocator, fields);
     }
 
     return error.UnsupportedFormat;
@@ -600,8 +595,8 @@ fn lastOffset(comptime OffsetInt: type, array: *const ArrowArray, length: usize)
 /// The logical type of child `i` in the canonical layout of a nested type.
 fn childTypeAt(data_type: DataType, i: usize) DataType {
     return switch (data_type) {
-        .list => data_type.list.*,
-        .@"struct" => data_type.@"struct"[i],
+        .list => data_type.list.data_type,
+        .@"struct" => data_type.@"struct"[i].data_type,
         else => unreachable,
     };
 }

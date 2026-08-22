@@ -174,12 +174,12 @@ pub const ArrayData = struct {
         if (self.children.len != childCount(self.data_type)) return error.ChildCountMismatch;
         if (self.null_count > self.length) return error.InvalidNullCount;
         switch (self.data_type) {
-            .list => |child_type| {
-                if (!self.children[0].data_type.equals(child_type.*)) return error.ChildTypeMismatch;
+            .list => |child_field| {
+                if (!self.children[0].data_type.equals(child_field.data_type)) return error.ChildTypeMismatch;
             },
-            .@"struct" => |field_types| {
-                for (field_types, self.children) |field_type, nested| {
-                    if (!nested.data_type.equals(field_type)) return error.ChildTypeMismatch;
+            .@"struct" => |fields| {
+                for (fields, self.children) |field, nested| {
+                    if (!nested.data_type.equals(field.data_type)) return error.ChildTypeMismatch;
                 }
             },
             else => {},

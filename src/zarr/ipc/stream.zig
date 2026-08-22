@@ -212,13 +212,11 @@ pub fn decodeBatchMessage(allocator: Allocator, bytes: []const u8, column_type: 
     return batch.readRecordBatch(allocator, header, column_type, envelope.body[0..body_len]);
 }
 
-/// The struct type over a schema's column types, which is the shape of a
-/// batch's columns in erased form. The caller owns the returned type.
+/// The struct type over a schema's fields, which is the shape of a batch's
+/// columns in erased form. The struct carries the schema's field names and
+/// nullability. The caller owns the returned type.
 pub fn columnTypeOf(allocator: Allocator, schema: Schema) Allocator.Error!DataType {
-    const child_types = try allocator.alloc(DataType, schema.fields.len);
-    defer allocator.free(child_types);
-    for (schema.fields, 0..) |f, i| child_types[i] = f.data_type;
-    return DataType.initStruct(allocator, child_types);
+    return DataType.initStructFields(allocator, schema.fields);
 }
 
 const testing = std.testing;
@@ -419,7 +417,7 @@ test "reader walks a stream written by pyarrow" {
     try testing.expect(!reader.schema.field(0).nullable);
     try testing.expect(reader.schema.field(1).data_type.equals(.utf8));
     try testing.expect(reader.schema.field(2).data_type == .list);
-    try testing.expect(reader.schema.field(2).data_type.list.equals(.int64));
+    try testing.expect(reader.schema.field(2).data_type.list.data_type.equals(.int64));
 
     var first = (try reader.next()).?;
     defer first.deinit();
