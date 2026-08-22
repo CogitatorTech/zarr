@@ -94,8 +94,8 @@ type round-trips through. The C Data Interface (`src/zarr/c_data.zig`) exports a
 `src/zarr/ipc/`: a minimal FlatBuffers runtime, message framing, schema and record batch serialization, and the stream and file formats. Both the C Data
 Interface and IPC are interop-proven against pyarrow in both directions. `make interop` runs the scripts under `test/interop/`, and fixture tests inside the
 IPC modules pin pyarrow-written bytes without a network or Python dependency. Not yet implemented: dictionary batches, body compression, and the spec types
-missing from `DataType`, such as decimal, interval, fixed-size layouts, map, and union. Readers report these as unsupported errors instead of guessing.
-Temporal coverage is complete: date, time, duration, and timestamps with or without a timezone.
+missing from `DataType`: interval, map, union, and the view layouts. Readers report these as unsupported errors instead of guessing.
+Temporal coverage is complete (date, time, duration, and timestamps with or without a timezone), and so are decimals and the fixed-size layouts.
 
 ## Zig Conventions
 

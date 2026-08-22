@@ -168,6 +168,7 @@ fn countNodes(data_type: DataType) usize {
     var n: usize = 1;
     switch (data_type) {
         .list => |child| n += countNodes(child.data_type),
+        .fixed_size_list => |fsl| n += countNodes(fsl.child.data_type),
         .@"struct" => |fields| for (fields) |field| {
             n += countNodes(field.data_type);
         },
@@ -181,6 +182,7 @@ fn countBuffers(data_type: DataType) usize {
     var n = ArrayData.bufferCount(data_type);
     switch (data_type) {
         .list => |child| n += countBuffers(child.data_type),
+        .fixed_size_list => |fsl| n += countBuffers(fsl.child.data_type),
         .@"struct" => |fields| for (fields) |field| {
             n += countBuffers(field.data_type);
         },
@@ -294,6 +296,10 @@ fn readColumn(
     switch (data_type) {
         .list => |child_field| {
             children[0] = try readColumn(allocator, table, child_field.data_type, body, node_i, buffer_i);
+            finished += 1;
+        },
+        .fixed_size_list => |fsl| {
+            children[0] = try readColumn(allocator, table, fsl.child.data_type, body, node_i, buffer_i);
             finished += 1;
         },
         .@"struct" => |child_fields| for (child_fields, 0..) |child_field, i| {

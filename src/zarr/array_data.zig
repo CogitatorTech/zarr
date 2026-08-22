@@ -58,7 +58,7 @@ pub const ArrayData = struct {
             .null => 0,
             .binary, .utf8, .large_binary, .large_utf8 => 3, // validity, offsets, values
             .list => 2, // validity, offsets
-            .@"struct" => 1, // validity only
+            .@"struct", .fixed_size_list => 1, // validity only
             else => 2, // validity, values
         };
     }
@@ -66,7 +66,7 @@ pub const ArrayData = struct {
     /// Number of child arrays in the canonical layout of `data_type`.
     pub fn childCount(data_type: DataType) usize {
         return switch (data_type) {
-            .list => 1,
+            .list, .fixed_size_list => 1,
             .@"struct" => |fields| fields.len,
             else => 0,
         };
@@ -147,6 +147,10 @@ pub const ArrayData = struct {
     /// `large_utf8` array, sliced out of the value buffer using the offsets.
     pub fn valueBytes(self: Self, i: usize) []const u8 {
         std.debug.assert(i < self.length);
+        if (self.data_type == .fixed_size_binary) {
+            const width: usize = @intCast(self.data_type.fixed_size_binary);
+            return self.buffers[1].?.data[i * width ..][0..width];
+        }
         const value_buffer = self.buffers[2].?;
         return switch (self.data_type) {
             .binary, .utf8 => blk: {
@@ -176,6 +180,9 @@ pub const ArrayData = struct {
         switch (self.data_type) {
             .list => |child_field| {
                 if (!self.children[0].data_type.equals(child_field.data_type)) return error.ChildTypeMismatch;
+            },
+            .fixed_size_list => |fsl| {
+                if (!self.children[0].data_type.equals(fsl.child.data_type)) return error.ChildTypeMismatch;
             },
             .@"struct" => |fields| {
                 for (fields, self.children) |field, nested| {
@@ -213,8 +220,17 @@ pub const ArrayData = struct {
             .large_binary => try self.validateVariable(i64, false),
             .large_utf8 => try self.validateVariable(i64, true),
             .list => _ = try self.checkedOffsets(i32, self.children[0].length),
+            .fixed_size_list => |fsl| {
+                const size: usize = @intCast(fsl.size);
+                if (self.children[0].length < self.length * size) return error.ChildLengthMismatch;
+            },
             .@"struct" => for (self.children) |nested| {
                 if (nested.length < self.length) return error.ChildLengthMismatch;
+            },
+            .fixed_size_binary => |width| {
+                const value_buffer = self.buffers[1] orelse return error.BufferTooSmall;
+                const w: usize = @intCast(width);
+                if (w != 0 and self.length > value_buffer.data.len / w) return error.BufferTooSmall;
             },
             else => {
                 const bits = self.data_type.bitWidth().?;
@@ -669,4 +685,40 @@ test "validateFull recurses into children" {
     var data = try ArrayData.init(allocator, struct_type, 2, 0, try buffersOf(allocator, &.{null}), try childrenOf(allocator, &.{child}));
     defer data.deinit();
     try testing.expectError(error.BufferTooSmall, data.validateFull());
+}
+
+test "fixed-size binary layout reads values and validates sizing" {
+    const allocator = testing.allocator;
+    const values = try Buffer.dupe(allocator, "abcdefgh");
+    var data = try ArrayData.init(allocator, .{ .fixed_size_binary = 4 }, 2, 0, try buffersOf(allocator, &.{ null, values }), try childrenOf(allocator, &.{}));
+    defer data.deinit();
+
+    try data.validateFull();
+    try testing.expectEqualStrings("abcd", data.valueBytes(0));
+    try testing.expectEqualStrings("efgh", data.valueBytes(1));
+}
+
+test "validateFull rejects a fixed-size binary buffer that is too small" {
+    const allocator = testing.allocator;
+    const values = try Buffer.dupe(allocator, "abcdef"); // 2 elements of width 4 need 8
+    var data = try ArrayData.init(allocator, .{ .fixed_size_binary = 4 }, 2, 0, try buffersOf(allocator, &.{ null, values }), try childrenOf(allocator, &.{}));
+    defer data.deinit();
+    try testing.expectError(error.BufferTooSmall, data.validateFull());
+}
+
+test "fixed-size list validates its child length" {
+    const allocator = testing.allocator;
+    const child_values = try Buffer.alloc(allocator, 6 * @sizeOf(i32));
+    const child = try ArrayData.init(allocator, .int32, 6, 0, try buffersOf(allocator, &.{ null, child_values }), try childrenOf(allocator, &.{}));
+    const list_type = try DataType.initFixedSizeList(allocator, .int32, 3);
+    var data = try ArrayData.init(allocator, list_type, 2, 0, try buffersOf(allocator, &.{null}), try childrenOf(allocator, &.{child}));
+    defer data.deinit();
+    try data.validateFull();
+
+    const short_values = try Buffer.alloc(allocator, 5 * @sizeOf(i32));
+    const short_child = try ArrayData.init(allocator, .int32, 5, 0, try buffersOf(allocator, &.{ null, short_values }), try childrenOf(allocator, &.{}));
+    const list_type2 = try DataType.initFixedSizeList(allocator, .int32, 3);
+    var short_data = try ArrayData.init(allocator, list_type2, 2, 0, try buffersOf(allocator, &.{null}), try childrenOf(allocator, &.{short_child}));
+    defer short_data.deinit();
+    try testing.expectError(error.ChildLengthMismatch, short_data.validateFull());
 }

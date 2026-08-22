@@ -136,6 +136,9 @@ pub fn formatString(data_type: DataType) [:0]const u8 {
             .microsecond => "tDu",
             .nanosecond => "tDn",
         },
+        // Decimal and fixed-size formats embed their parameters, so
+        // `exportSchemaNamed` builds them as owned strings.
+        .decimal128, .decimal256, .fixed_size_binary, .fixed_size_list => unreachable,
         .list => "+l",
         .@"struct" => "+s",
     };
@@ -232,6 +235,10 @@ fn exportSchemaNamed(allocator: Allocator, data_type: DataType, name: ?[]const u
             list_child[0] = child.*;
             break :blk list_child[0..];
         },
+        .fixed_size_list => |fsl| blk: {
+            list_child[0] = fsl.child.*;
+            break :blk list_child[0..];
+        },
         .@"struct" => |fields| fields,
         else => &[_]Field{},
     };
@@ -271,10 +278,15 @@ fn exportSchemaNamed(allocator: Allocator, data_type: DataType, name: ?[]const u
 
     var owned_format: ?[:0]u8 = null;
     errdefer if (owned_format) |f| allocator.free(f);
-    if (data_type == .timestamp) {
-        if (data_type.timestamp.timezone) |tz| {
+    switch (data_type) {
+        .timestamp => |ts| if (ts.timezone) |tz| {
             owned_format = try std.fmt.allocPrintSentinel(allocator, "{s}{s}", .{ formatString(data_type), tz }, 0);
-        }
+        },
+        .decimal128 => |d| owned_format = try std.fmt.allocPrintSentinel(allocator, "d:{d},{d}", .{ d.precision, d.scale }, 0),
+        .decimal256 => |d| owned_format = try std.fmt.allocPrintSentinel(allocator, "d:{d},{d},256", .{ d.precision, d.scale }, 0),
+        .fixed_size_binary => |width| owned_format = try std.fmt.allocPrintSentinel(allocator, "w:{d}", .{width}, 0),
+        .fixed_size_list => |fsl| owned_format = try std.fmt.allocPrintSentinel(allocator, "+w:{d}", .{fsl.size}, 0),
+        else => {},
     }
 
     const priv = try allocator.create(SchemaPrivate);
@@ -453,6 +465,45 @@ pub fn importSchema(allocator: Allocator, schema: *const ArrowSchema) ImportErro
     if (eq(fmt, "ttm")) return .{ .time32 = .millisecond };
     if (eq(fmt, "ttu")) return .{ .time64 = .microsecond };
     if (eq(fmt, "ttn")) return .{ .time64 = .nanosecond };
+    // Decimal: "d:precision,scale" with an optional ",bitWidth".
+    if (fmt.len > 2 and fmt[0] == 'd' and fmt[1] == ':') {
+        var it = std.mem.splitScalar(u8, fmt[2..], ',');
+        const precision_s = it.next() orelse return error.InvalidFormat;
+        const scale_s = it.next() orelse return error.InvalidFormat;
+        const width_s = it.next();
+        if (it.next() != null) return error.InvalidFormat;
+        const params = @import("datatype.zig").DecimalParams{
+            .precision = std.fmt.parseInt(u8, precision_s, 10) catch return error.InvalidFormat,
+            .scale = std.fmt.parseInt(i8, scale_s, 10) catch return error.InvalidFormat,
+        };
+        const width = if (width_s) |w|
+            std.fmt.parseInt(i32, w, 10) catch return error.InvalidFormat
+        else
+            128;
+        return switch (width) {
+            128 => .{ .decimal128 = params },
+            256 => .{ .decimal256 = params },
+            else => error.UnsupportedFormat,
+        };
+    }
+
+    // Fixed-size binary: "w:byteWidth".
+    if (fmt.len > 2 and fmt[0] == 'w' and fmt[1] == ':') {
+        const width = std.fmt.parseInt(i32, fmt[2..], 10) catch return error.InvalidFormat;
+        if (width < 0) return error.InvalidFormat;
+        return .{ .fixed_size_binary = width };
+    }
+
+    // Fixed-size list: "+w:listSize", with one child schema.
+    if (fmt.len > 3 and fmt[0] == '+' and fmt[1] == 'w' and fmt[2] == ':') {
+        const size = std.fmt.parseInt(i32, fmt[3..], 10) catch return error.InvalidFormat;
+        if (size < 0) return error.InvalidFormat;
+        if (schema.n_children != 1 or schema.children == null) return error.InvalidFormat;
+        var child = try importField(allocator, schema.children.?[0]);
+        defer child.deinit(allocator);
+        return DataType.initFixedSizeListField(allocator, child, size);
+    }
+
     if (eq(fmt, "tDs")) return .{ .duration = .second };
     if (eq(fmt, "tDm")) return .{ .duration = .millisecond };
     if (eq(fmt, "tDu")) return .{ .duration = .microsecond };
@@ -605,6 +656,17 @@ fn importArraySlice(
                 children[i] = try importArraySlice(allocator, field.data_type, array.children.?[i], total, length);
                 built_children += 1;
             }
+        },
+        .fixed_size_binary => |width| {
+            const w: usize = @intCast(width);
+            const src = bufferAt(array, 1) orelse return error.InvalidFormat;
+            buffers[1] = try Buffer.dupe(allocator, src[total * w ..][0 .. length * w]);
+        },
+        .fixed_size_list => |fsl| {
+            // Element i spans child elements [i * size, (i + 1) * size).
+            const size: usize = @intCast(fsl.size);
+            children[0] = try importArraySlice(allocator, fsl.child.data_type, array.children.?[0], total * size, length * size);
+            built_children = 1;
         },
         else => {
             const width = data_type.bitWidth().? / 8;
@@ -1204,6 +1266,47 @@ test "temporal types round-trip through the C schema" {
         defer back.deinit(allocator);
         try testing.expect(back.equals(dt));
     }
+}
+
+test "decimal and fixed-size types round-trip through the C schema" {
+    const allocator = testing.allocator;
+
+    const d128 = DataType{ .decimal128 = .{ .precision = 19, .scale = 4 } };
+    var cs1: ArrowSchema = undefined;
+    try exportSchema(allocator, d128, &cs1);
+    defer cs1.release.?(&cs1);
+    try testing.expectEqualStrings("d:19,4", std.mem.span(cs1.format));
+    var back1 = try importSchema(allocator, &cs1);
+    defer back1.deinit(allocator);
+    try testing.expect(back1.equals(d128));
+
+    const d256 = DataType{ .decimal256 = .{ .precision = 76, .scale = 10 } };
+    var cs2: ArrowSchema = undefined;
+    try exportSchema(allocator, d256, &cs2);
+    defer cs2.release.?(&cs2);
+    try testing.expectEqualStrings("d:76,10,256", std.mem.span(cs2.format));
+    var back2 = try importSchema(allocator, &cs2);
+    defer back2.deinit(allocator);
+    try testing.expect(back2.equals(d256));
+
+    const fsb = DataType{ .fixed_size_binary = 19 };
+    var cs3: ArrowSchema = undefined;
+    try exportSchema(allocator, fsb, &cs3);
+    defer cs3.release.?(&cs3);
+    try testing.expectEqualStrings("w:19", std.mem.span(cs3.format));
+    var back3 = try importSchema(allocator, &cs3);
+    defer back3.deinit(allocator);
+    try testing.expect(back3.equals(fsb));
+
+    var fsl = try DataType.initFixedSizeList(allocator, .int32, 3);
+    defer fsl.deinit(allocator);
+    var cs4: ArrowSchema = undefined;
+    try exportSchema(allocator, fsl, &cs4);
+    defer cs4.release.?(&cs4);
+    try testing.expectEqualStrings("+w:3", std.mem.span(cs4.format));
+    var back4 = try importSchema(allocator, &cs4);
+    defer back4.deinit(allocator);
+    try testing.expect(back4.equals(fsl));
 }
 
 test "a zoned timestamp round-trips through the C schema" {

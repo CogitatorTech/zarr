@@ -33,9 +33,9 @@ pub const DecodeError = error{
 
 // Members of the `Type` union in Schema.fbs, in declaration order.
 // FlatBuffers numbers union members from 1; 0 means absent. Members Zarr does
-// not implement (Decimal 7, Interval 11, Union 14, FixedSizeBinary 15,
-// FixedSizeList 16, Map 17, and the members past LargeList) have no constant
-// here and decode to `error.UnsupportedType`.
+// not implement (Interval 11, Union 14, Map 17, and the members past
+// LargeList) have no constant here and decode to `error.UnsupportedType`.
+const type_decimal: u8 = 7;
 const type_null: u8 = 1;
 const type_int: u8 = 2;
 const type_floating_point: u8 = 3;
@@ -44,6 +44,8 @@ const type_utf8: u8 = 5;
 const type_bool: u8 = 6;
 const type_date: u8 = 8;
 const type_time: u8 = 9;
+const type_fixed_size_binary: u8 = 15;
+const type_fixed_size_list: u8 = 16;
 const type_timestamp: u8 = 10;
 const type_list: u8 = 12;
 const type_duration: u8 = 18;
@@ -96,6 +98,12 @@ fn writeField(b: *Builder, name: []const u8, data_type: DataType, nullable: bool
     switch (data_type) {
         .list => |child| {
             const item = try writeField(b, child.name, child.data_type, child.nullable);
+            try b.startVector(4, 1, 4);
+            try b.pushOffsetElement(item);
+            children_off = try b.endVector(1);
+        },
+        .fixed_size_list => |fsl| {
+            const item = try writeField(b, fsl.child.name, fsl.child.data_type, fsl.child.nullable);
             try b.startVector(4, 1, 4);
             try b.pushOffsetElement(item);
             children_off = try b.endVector(1);
@@ -161,6 +169,20 @@ fn writeType(b: *Builder, data_type: DataType) Allocator.Error!TypeOffset {
         .time64 => |unit| writeTimeType(b, unit, 64),
         // Duration.unit: the schema default is MILLISECOND (1).
         .duration => |unit| writeScalarType(b, type_duration, @intFromEnum(unit), 1),
+        .decimal128 => |d| writeDecimalType(b, d, 128),
+        .decimal256 => |d| writeDecimalType(b, d, 256),
+        // FixedSizeBinary.byteWidth at slot 0.
+        .fixed_size_binary => |width| blk: {
+            b.startTable();
+            try b.addScalar(i32, 0, width, 0);
+            break :blk .{ .tag = type_fixed_size_binary, .offset = try b.endTable() };
+        },
+        // FixedSizeList.listSize at slot 0.
+        .fixed_size_list => |fsl| blk: {
+            b.startTable();
+            try b.addScalar(i32, 0, fsl.size, 0);
+            break :blk .{ .tag = type_fixed_size_list, .offset = try b.endTable() };
+        },
         .list => writeEmptyType(b, type_list),
         .@"struct" => writeEmptyType(b, type_struct),
     };
@@ -199,6 +221,16 @@ fn writeTimeType(b: *Builder, unit: datatype.TimeUnit, bits: i32) Allocator.Erro
     try b.addScalar(i16, 0, @intFromEnum(unit), 1);
     try b.addScalar(i32, 1, bits, 32);
     return .{ .tag = type_time, .offset = try b.endTable() };
+}
+
+/// Writes a `Decimal` type table: precision at slot 0, scale at slot 1, and
+/// bit width at slot 2 (default 128).
+fn writeDecimalType(b: *Builder, d: datatype.DecimalParams, bits: i32) Allocator.Error!TypeOffset {
+    b.startTable();
+    try b.addScalar(i32, 0, d.precision, 0);
+    try b.addScalar(i32, 1, d.scale, 0);
+    try b.addScalar(i32, 2, bits, 128);
+    return .{ .tag = type_decimal, .offset = try b.endTable() };
 }
 
 /// Writes an `Int` type table: bit width at slot 0, signedness at slot 1.
@@ -335,6 +367,38 @@ fn readType(allocator: Allocator, field_table: Table, depth: usize) DecodeError!
             if (bits == 64 and unit == 2) return .{ .time64 = .microsecond };
             if (bits == 64 and unit == 3) return .{ .time64 = .nanosecond };
             return error.MalformedSchema;
+        },
+        type_decimal => {
+            const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
+            const precision = try t.readScalar(i32, 0, 0);
+            const scale = try t.readScalar(i32, 1, 0);
+            const bits = try t.readScalar(i32, 2, 128);
+            if (precision < 1 or scale < -128 or scale > 127) return error.MalformedSchema;
+            const params = datatype.DecimalParams{
+                .precision = std.math.cast(u8, precision) orelse return error.MalformedSchema,
+                .scale = @intCast(scale),
+            };
+            // The spec caps precision at 38 digits for 128 bits and 76 for 256.
+            return switch (bits) {
+                128 => if (params.precision <= 38) .{ .decimal128 = params } else error.MalformedSchema,
+                256 => if (params.precision <= 76) .{ .decimal256 = params } else error.MalformedSchema,
+                else => error.UnsupportedType,
+            };
+        },
+        type_fixed_size_binary => {
+            const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
+            const width = try t.readScalar(i32, 0, 0);
+            if (width < 0) return error.MalformedSchema;
+            return .{ .fixed_size_binary = width };
+        },
+        type_fixed_size_list => {
+            const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
+            const size = try t.readScalar(i32, 0, 0);
+            if (size < 0) return error.MalformedSchema;
+            if (try field_table.vectorLen(field_slot_children) != 1) return error.MalformedSchema;
+            var child = try readField(allocator, try field_table.vectorTable(field_slot_children, 0), depth + 1);
+            defer child.deinit(allocator);
+            return DataType.initFixedSizeListField(allocator, child, size);
         },
         type_duration => {
             const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
@@ -613,6 +677,65 @@ test "temporal types round-trip, including zoned timestamps" {
     try testing.expect(back.field(5).data_type.timestamp.timezone == null);
 }
 
+test "decimal and fixed-size types round-trip" {
+    const allocator = testing.allocator;
+
+    var points = try DataType.initFixedSizeList(allocator, .float64, 2);
+    defer points.deinit(allocator);
+
+    var fields: [4]Field = undefined;
+    var built: usize = 0;
+    defer for (fields[0..built]) |*f| f.deinit(allocator);
+    fields[0] = try Field.init(allocator, "price", .{ .decimal128 = .{ .precision = 19, .scale = 4 } }, true);
+    built += 1;
+    fields[1] = try Field.init(allocator, "huge", .{ .decimal256 = .{ .precision = 76, .scale = 10 } }, true);
+    built += 1;
+    fields[2] = try Field.init(allocator, "uuid", .{ .fixed_size_binary = 16 }, false);
+    built += 1;
+    fields[3] = try Field.init(allocator, "pair", points, true);
+    built += 1;
+    var schema = try Schema.init(allocator, fields[0..]);
+    defer schema.deinit(allocator);
+
+    const bytes = try encode(allocator, schema);
+    defer allocator.free(bytes);
+    var back = try decode(allocator, bytes);
+    defer back.deinit(allocator);
+
+    try testing.expect(schema.equals(back));
+    try testing.expectEqual(@as(i32, 2), back.field(3).data_type.fixed_size_list.size);
+    try testing.expectEqualStrings("item", back.field(3).data_type.fixed_size_list.child.name);
+}
+
+test "decode rejects a decimal whose precision exceeds its width" {
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+
+    // 39 digits do not fit in 128 bits.
+    b.startTable();
+    try b.addScalar(i32, 0, 39, 0);
+    try b.addScalar(i32, 1, 2, 0);
+    const decimal_type = try b.endTable();
+
+    const field_name = try b.createString("price");
+    b.startTable();
+    try b.addOffset(0, field_name);
+    try b.addScalar(u8, 2, 7, 0); // Type.Decimal
+    try b.addOffset(3, decimal_type);
+    const field_off = try b.endTable();
+
+    try b.startVector(4, 1, 4);
+    try b.pushOffsetElement(field_off);
+    const fields_off = try b.endVector(1);
+
+    b.startTable();
+    try b.addOffset(1, fields_off);
+    const root = try b.endTable();
+    const buf = try b.finish(root);
+
+    try testing.expectError(error.MalformedSchema, decode(testing.allocator, buf));
+}
+
 test "decode rejects a time whose unit and width disagree" {
     var b = Builder.init(testing.allocator);
     defer b.deinit();
@@ -646,17 +769,16 @@ test "decode rejects a type Zarr does not implement" {
     var b = Builder.init(testing.allocator);
     defer b.deinit();
 
-    // A Decimal type table: precision 10, scale 2.
+    // An Interval type table: unit YEAR_MONTH.
     b.startTable();
-    try b.addScalar(i32, 0, 10, 0);
-    try b.addScalar(i32, 1, 2, 0);
-    const decimal_type = try b.endTable();
+    try b.addScalar(i16, 0, 0, 0);
+    const interval_type = try b.endTable();
 
-    const field_name = try b.createString("price");
+    const field_name = try b.createString("span");
     b.startTable();
     try b.addOffset(0, field_name);
-    try b.addScalar(u8, 2, 7, 0); // Type.Decimal
-    try b.addOffset(3, decimal_type);
+    try b.addScalar(u8, 2, 11, 0); // Type.Interval
+    try b.addOffset(3, interval_type);
     const field_off = try b.endTable();
 
     try b.startVector(4, 1, 4);

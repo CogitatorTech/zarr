@@ -298,8 +298,35 @@ fn buildType(allocator: std.mem.Allocator, field_obj: std.json.ObjectMap) BuildE
     if (eq(u8, kind, "duration")) {
         return .{ .duration = try parseTimeUnit(type_obj) };
     }
+    if (eq(u8, kind, "decimal")) {
+        const precision = type_obj.get("precision").?.integer;
+        const scale = type_obj.get("scale").?.integer;
+        const bits = if (type_obj.get("bitWidth")) |w| w.integer else 128;
+        if (precision < 1 or precision > 255 or scale < -128 or scale > 127) return error.MalformedGolden;
+        const params: @FieldType(zarr.DataType, "decimal128") = .{
+            .precision = @intCast(precision),
+            .scale = @intCast(scale),
+        };
+        return switch (bits) {
+            128 => .{ .decimal128 = params },
+            256 => .{ .decimal256 = params },
+            else => error.UnsupportedGolden,
+        };
+    }
+    if (eq(u8, kind, "fixedsizebinary")) {
+        const width = type_obj.get("byteWidth").?.integer;
+        if (width < 0) return error.MalformedGolden;
+        return .{ .fixed_size_binary = @intCast(width) };
+    }
 
     const children = field_obj.get("children").?.array.items;
+    if (eq(u8, kind, "fixedsizelist")) {
+        const size = type_obj.get("listSize").?.integer;
+        if (size < 0 or children.len != 1) return error.MalformedGolden;
+        var child = try buildField(allocator, children[0]);
+        defer child.deinit(allocator);
+        return zarr.DataType.initFixedSizeListField(allocator, child, @intCast(size));
+    }
     if (eq(u8, kind, "list")) {
         if (children.len != 1) return error.MalformedGolden;
         var child = try buildField(allocator, children[0]);
@@ -387,6 +414,20 @@ fn compareColumn(column_json: std.json.Value, data: zarr.ArrayData, data_type: z
         .uint64 => try compareInts(obj, data, u64, totals),
         .date32, .time32 => try compareInts(obj, data, i32, totals),
         .date64, .timestamp, .time64, .duration => try compareInts(obj, data, i64, totals),
+        .decimal128 => try compareInts(obj, data, i128, totals),
+        .decimal256 => try compareInts(obj, data, i256, totals),
+        .fixed_size_binary => {
+            for (obj.get("DATA").?.array.items, 0..) |v, i| {
+                if (!data.isValid(i)) continue;
+                if (v != .string) return error.MalformedGolden;
+                try compareHexValue(v.string, data.valueBytes(i));
+                totals.values += 1;
+            }
+        },
+        .fixed_size_list => |fsl| {
+            const child_json = obj.get("children").?.array.items[0];
+            try compareColumn(child_json, data.child(0), fsl.child.data_type, totals);
+        },
         .float16 => try compareFloats(obj, data, f16, totals),
         .float32 => try compareFloats(obj, data, f32, totals),
         .float64 => try compareFloats(obj, data, f64, totals),
@@ -464,18 +505,20 @@ fn compareText(obj: std.json.ObjectMap, data: zarr.ArrayData, comptime OffsetInt
     }
 }
 
+fn compareHexValue(hex: []const u8, got: []const u8) !void {
+    if (hex.len != got.len * 2) return error.ValueMismatch;
+    for (got, 0..) |byte, j| {
+        const expected = std.fmt.parseInt(u8, hex[j * 2 ..][0..2], 16) catch return error.MalformedGolden;
+        if (byte != expected) return error.ValueMismatch;
+    }
+}
+
 fn compareHex(obj: std.json.ObjectMap, data: zarr.ArrayData, comptime OffsetInt: type, totals: *Totals) !void {
     try compareOffsets(obj, data, OffsetInt, totals);
     for (obj.get("DATA").?.array.items, 0..) |v, i| {
         if (!data.isValid(i)) continue;
         if (v != .string) return error.MalformedGolden;
-        const hex = v.string;
-        const got = data.valueBytes(i);
-        if (hex.len != got.len * 2) return error.ValueMismatch;
-        for (got, 0..) |byte, j| {
-            const expected = std.fmt.parseInt(u8, hex[j * 2 ..][0..2], 16) catch return error.MalformedGolden;
-            if (byte != expected) return error.ValueMismatch;
-        }
+        try compareHexValue(v.string, data.valueBytes(i));
         totals.values += 1;
     }
 }

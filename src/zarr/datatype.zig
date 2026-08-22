@@ -26,6 +26,20 @@ pub const TimestampType = struct {
     timezone: ?[]const u8 = null,
 };
 
+/// Parameters of a decimal type: the number of significant digits and the
+/// number of digits after the decimal point.
+pub const DecimalParams = struct {
+    precision: u8,
+    scale: i8,
+};
+
+/// Parameters of a fixed-size list type: one child element field, heap-owned
+/// like a list's, and the fixed number of elements per slot.
+pub const FixedSizeListType = struct {
+    child: *const Field,
+    size: i32,
+};
+
 fn optStrEq(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(u8, a.?, b.?);
@@ -103,6 +117,15 @@ pub const DataType = union(enum) {
     time64: TimeUnit,
     /// An elapsed amount of time as i64, in the given unit.
     duration: TimeUnit,
+    /// A 128-bit decimal with the given precision and scale.
+    decimal128: DecimalParams,
+    /// A 256-bit decimal with the given precision and scale.
+    decimal256: DecimalParams,
+    /// Byte strings of one fixed width, with no offsets buffer.
+    fixed_size_binary: i32,
+    /// Lists of one fixed element count, with no offsets buffer. Owns a
+    /// heap-allocated child field; release it with `deinit`.
+    fixed_size_list: FixedSizeListType,
     /// A list of a single child element field (32-bit offsets), whose name
     /// is conventionally "item". Owns a heap-allocated child field; release
     /// it with `deinit`.
@@ -119,7 +142,9 @@ pub const DataType = union(enum) {
             .int16, .uint16, .float16 => 16,
             .int32, .uint32, .float32, .date32, .time32 => 32,
             .int64, .uint64, .float64, .date64, .timestamp, .time64, .duration => 64,
-            .null, .binary, .utf8, .large_binary, .large_utf8, .list, .@"struct" => null,
+            .decimal128 => 128,
+            .decimal256 => 256,
+            .null, .binary, .utf8, .large_binary, .large_utf8, .list, .@"struct", .fixed_size_binary, .fixed_size_list => null,
         };
     }
 
@@ -129,6 +154,24 @@ pub const DataType = union(enum) {
     pub fn initTimestamp(allocator: Allocator, unit: TimeUnit, timezone: ?[]const u8) Allocator.Error!DataType {
         const owned = if (timezone) |tz| try allocator.dupe(u8, tz) else null;
         return .{ .timestamp = .{ .unit = unit, .timezone = owned } };
+    }
+
+    /// Builds a fixed-size list type from a bare element type, wrapping it
+    /// in the conventional child field, like `initList`. The caller retains
+    /// ownership of `child` and must release the returned type with `deinit`.
+    pub fn initFixedSizeList(allocator: Allocator, child: DataType, size: i32) Allocator.Error!DataType {
+        const owned = try allocator.create(Field);
+        errdefer allocator.destroy(owned);
+        owned.* = try Field.init(allocator, "item", child, true);
+        return .{ .fixed_size_list = .{ .child = owned, .size = size } };
+    }
+
+    /// Builds a fixed-size list type owning a deep copy of the child `field`.
+    pub fn initFixedSizeListField(allocator: Allocator, field: Field, size: i32) Allocator.Error!DataType {
+        const owned = try allocator.create(Field);
+        errdefer allocator.destroy(owned);
+        owned.* = try field.clone(allocator);
+        return .{ .fixed_size_list = .{ .child = owned, .size = size } };
     }
 
     /// Builds a list type from a bare element type, wrapping it in the
@@ -192,6 +235,7 @@ pub const DataType = union(enum) {
     pub fn clone(self: DataType, allocator: Allocator) Allocator.Error!DataType {
         return switch (self) {
             .timestamp => |ts| try initTimestamp(allocator, ts.unit, ts.timezone),
+            .fixed_size_list => |fsl| try initFixedSizeListField(allocator, fsl.child.*, fsl.size),
             .list => |child| try initListField(allocator, child.*),
             .@"struct" => |fields| try initStructFields(allocator, fields),
             else => self,
@@ -202,6 +246,10 @@ pub const DataType = union(enum) {
     pub fn deinit(self: *DataType, allocator: Allocator) void {
         switch (self.*) {
             .timestamp => |ts| if (ts.timezone) |tz| allocator.free(tz),
+            .fixed_size_list => |fsl| {
+                @constCast(fsl.child).deinit(allocator);
+                allocator.destroy(fsl.child);
+            },
             .list => |child| {
                 @constCast(child).deinit(allocator);
                 allocator.destroy(child);
@@ -224,6 +272,11 @@ pub const DataType = union(enum) {
             .time32 => |unit| unit == other.time32,
             .time64 => |unit| unit == other.time64,
             .duration => |unit| unit == other.duration,
+            .decimal128 => |d| d.precision == other.decimal128.precision and d.scale == other.decimal128.scale,
+            .decimal256 => |d| d.precision == other.decimal256.precision and d.scale == other.decimal256.scale,
+            .fixed_size_binary => |width| width == other.fixed_size_binary,
+            .fixed_size_list => |fsl| fsl.size == other.fixed_size_list.size and
+                fsl.child.equals(other.fixed_size_list.child.*),
             .list => |child| child.equals(other.list.*),
             .@"struct" => |fields| blk: {
                 const others = other.@"struct";
@@ -248,6 +301,11 @@ pub const DataType = union(enum) {
             .time32 => |unit| unit == other.time32,
             .time64 => |unit| unit == other.time64,
             .duration => |unit| unit == other.duration,
+            .decimal128 => |d| d.precision == other.decimal128.precision and d.scale == other.decimal128.scale,
+            .decimal256 => |d| d.precision == other.decimal256.precision and d.scale == other.decimal256.scale,
+            .fixed_size_binary => |width| width == other.fixed_size_binary,
+            .fixed_size_list => |fsl| fsl.size == other.fixed_size_list.size and
+                fsl.child.data_type.equalsLayout(other.fixed_size_list.child.data_type),
             .list => |child| child.data_type.equalsLayout(other.list.data_type),
             .@"struct" => |fields| blk: {
                 const others = other.@"struct";
@@ -490,4 +548,42 @@ test "zoned timestamps own their timezone" {
     var copy = try utc.clone(allocator);
     defer copy.deinit(allocator);
     try std.testing.expectEqualStrings("UTC", copy.timestamp.timezone.?);
+}
+
+test "decimal types carry precision, scale, and width" {
+    const d128 = DataType{ .decimal128 = .{ .precision = 19, .scale = 10 } };
+    const d256 = DataType{ .decimal256 = .{ .precision = 76, .scale = 2 } };
+    try std.testing.expectEqual(@as(?u16, 128), d128.bitWidth());
+    try std.testing.expectEqual(@as(?u16, 256), d256.bitWidth());
+    try std.testing.expect(d128.equals(.{ .decimal128 = .{ .precision = 19, .scale = 10 } }));
+    try std.testing.expect(!d128.equals(.{ .decimal128 = .{ .precision = 19, .scale = 9 } }));
+    try std.testing.expect(!d128.equals(d256));
+}
+
+test "fixed-size binary carries its byte width" {
+    const fsb = DataType{ .fixed_size_binary = 19 };
+    try std.testing.expectEqual(@as(?u16, null), fsb.bitWidth());
+    try std.testing.expect(fsb.equals(.{ .fixed_size_binary = 19 }));
+    try std.testing.expect(!fsb.equals(.{ .fixed_size_binary = 20 }));
+}
+
+test "fixed-size list owns its child field and keeps its size" {
+    const allocator = std.testing.allocator;
+    var ty = try DataType.initFixedSizeList(allocator, .int32, 3);
+    defer ty.deinit(allocator);
+
+    try std.testing.expectEqual(@as(i32, 3), ty.fixed_size_list.size);
+    try std.testing.expectEqualStrings("item", ty.fixed_size_list.child.name);
+    try std.testing.expect(ty.fixed_size_list.child.data_type.equals(.int32));
+
+    var same = try DataType.initFixedSizeList(allocator, .int32, 3);
+    defer same.deinit(allocator);
+    var wider = try DataType.initFixedSizeList(allocator, .int32, 4);
+    defer wider.deinit(allocator);
+    try std.testing.expect(ty.equals(same));
+    try std.testing.expect(!ty.equals(wider));
+
+    var copy = try ty.clone(allocator);
+    defer copy.deinit(allocator);
+    try std.testing.expect(copy.equals(ty));
 }
