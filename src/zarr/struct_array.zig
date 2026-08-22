@@ -335,8 +335,8 @@ test "struct array reports a struct data type over its fields" {
     defer ty.deinit(std.testing.allocator);
     try std.testing.expect(ty == .@"struct");
     try std.testing.expectEqual(@as(usize, 2), ty.@"struct".len);
-    try std.testing.expect(ty.@"struct"[0].equals(.int32));
-    try std.testing.expect(ty.@"struct"[1].equals(.utf8));
+    try std.testing.expect(ty.@"struct"[0].data_type.equals(.int32));
+    try std.testing.expect(ty.@"struct"[1].data_type.equals(.utf8));
 }
 
 test "struct array reports nested list fields in its data type" {
@@ -354,9 +354,9 @@ test "struct array reports nested list fields in its data type" {
 
     var ty = try array.dataType(std.testing.allocator);
     defer ty.deinit(std.testing.allocator);
-    try std.testing.expect(ty.@"struct"[0].equals(.int32));
-    try std.testing.expect(ty.@"struct"[1] == .list);
-    try std.testing.expect(ty.@"struct"[1].list.equals(.int32));
+    try std.testing.expect(ty.@"struct"[0].data_type.equals(.int32));
+    try std.testing.expect(ty.@"struct"[1].data_type == .list);
+    try std.testing.expect(ty.@"struct"[1].data_type.list.data_type.equals(.int32));
 }
 
 test "struct dataType leaks nothing on allocation failure" {

@@ -350,7 +350,7 @@ test "list array reports a list data type over its child" {
     var ty = try array.dataType(std.testing.allocator);
     defer ty.deinit(std.testing.allocator);
     try std_testing.expect(ty == .list);
-    try std_testing.expect(ty.list.equals(.int32));
+    try std_testing.expect(ty.list.data_type.equals(.int32));
 }
 
 test "nested list array reports a nested list data type" {
@@ -368,8 +368,8 @@ test "nested list array reports a nested list data type" {
     var ty = try array.dataType(std.testing.allocator);
     defer ty.deinit(std.testing.allocator);
     try std_testing.expect(ty == .list);
-    try std_testing.expect(ty.list.* == .list);
-    try std_testing.expect(ty.list.list.equals(.int32));
+    try std_testing.expect(ty.list.data_type == .list);
+    try std_testing.expect(ty.list.data_type.list.data_type.equals(.int32));
 }
 
 test "list dataType leaks nothing on allocation failure" {
@@ -406,7 +406,7 @@ test "list array converts to type-erased array data with a child" {
     defer data.deinit();
 
     try std_testing.expect(data.data_type == .list);
-    try std_testing.expect(data.data_type.list.equals(.int32));
+    try std_testing.expect(data.data_type.list.data_type.equals(.int32));
     try std_testing.expectEqual(@as(usize, 2), data.length);
     try std_testing.expectEqual(@as(usize, 2), data.buffers.len);
     try std_testing.expectEqual(@as(usize, 1), data.children.len);

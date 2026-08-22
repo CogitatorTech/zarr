@@ -50,7 +50,9 @@ pub fn RecordBatch(comptime column_types: []const type) type {
             inline for (0..column_types.len) |i| {
                 var col_type = try DataType.ofArray(columns.field(i).*, allocator);
                 defer col_type.deinit(allocator);
-                if (!col_type.equals(schema.field(i).data_type)) return error.SchemaMismatch;
+                // Layout comparison: a column array cannot carry field names,
+                // so the schema is the naming authority.
+                if (!col_type.equalsLayout(schema.field(i).data_type)) return error.SchemaMismatch;
             }
             // Validation passed; take ownership of the columns and a clone of
             // the schema. Cloning is the last fallible step, so a failure here
@@ -194,6 +196,43 @@ test "record batch rejects a schema whose field type differs" {
     defer columns.deinit();
 
     try std.testing.expectError(error.SchemaMismatch, PersonBatch.init(allocator, wrong, columns));
+}
+
+test "record batch accepts a schema with named struct fields" {
+    const allocator = std.testing.allocator;
+    const Field = @import("schema.zig").Field;
+    const StructColumn = @import("struct_array.zig").StructArray(&.{ PrimitiveArray(f64), Utf8Array });
+    const point_columns = [_]type{StructColumn};
+    const PointBatch = RecordBatch(&point_columns);
+
+    // The schema names the struct's fields; the column array cannot carry
+    // names, so validation compares layout, not names.
+    var x = try Field.init(allocator, "x", .float64, false);
+    defer x.deinit(allocator);
+    var label = try Field.init(allocator, "label", .utf8, true);
+    defer label.deinit(allocator);
+    var point_type = try DataType.initStructFields(allocator, &.{ x, label });
+    defer point_type.deinit(allocator);
+    var point = try Field.init(allocator, "point", point_type, true);
+    defer point.deinit(allocator);
+    var schema = try Schema.init(allocator, &.{point});
+    defer schema.deinit(allocator);
+
+    var builder = PointBatch.Columns.Builder.init(allocator);
+    defer builder.deinit();
+    try builder.children[0].children[0].append(1.5);
+    try builder.children[0].children[1].append("a");
+    try builder.children[0].append();
+    try builder.append();
+    try builder.children[0].appendNull();
+    try builder.append();
+    const columns = try builder.finish();
+
+    var batch = try PointBatch.init(allocator, schema, columns);
+    defer batch.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), batch.numRows());
+    try std.testing.expectEqualStrings("x", batch.schema.field(0).data_type.@"struct"[0].name);
 }
 
 test "record batch validates nested column types" {
