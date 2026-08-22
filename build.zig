@@ -59,6 +59,48 @@ pub fn build(b: *std.Build) void {
     const corpus_step = b.step("corpus-check", "Run the arrow-testing IPC fuzz corpus through the IPC readers");
     corpus_step.dependOn(&run_corpus.step);
 
+    // Differential IPC test against nanoarrow, run on demand via
+    // `zig build interop-nanoarrow`. Compiles the vendored nanoarrow sources
+    // from the external/nanoarrow submodule with Zig's C compiler, so no
+    // system packages are needed. The step fails to build when the submodule
+    // is absent; `make interop-nanoarrow` guards for that and skips.
+    const nanoarrow_module = b.createModule(.{
+        .root_source_file = b.path("tools/nanoarrow_differential.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    nanoarrow_module.addImport("zarr", zarr_module);
+    nanoarrow_module.addIncludePath(b.path("tools/nanoarrow_include"));
+    nanoarrow_module.addIncludePath(b.path("external/nanoarrow/src"));
+    nanoarrow_module.addIncludePath(b.path("external/nanoarrow/thirdparty/flatcc/include"));
+    nanoarrow_module.addCSourceFiles(.{
+        .files = &.{
+            "tools/nanoarrow_shim.c",
+            "external/nanoarrow/src/nanoarrow/common/array.c",
+            "external/nanoarrow/src/nanoarrow/common/array_stream.c",
+            "external/nanoarrow/src/nanoarrow/common/schema.c",
+            "external/nanoarrow/src/nanoarrow/common/utils.c",
+            "external/nanoarrow/src/nanoarrow/ipc/codecs.c",
+            "external/nanoarrow/src/nanoarrow/ipc/decoder.c",
+            "external/nanoarrow/src/nanoarrow/ipc/encoder.c",
+            "external/nanoarrow/src/nanoarrow/ipc/reader.c",
+            "external/nanoarrow/src/nanoarrow/ipc/writer.c",
+            "external/nanoarrow/thirdparty/flatcc/src/runtime/builder.c",
+            "external/nanoarrow/thirdparty/flatcc/src/runtime/emitter.c",
+            "external/nanoarrow/thirdparty/flatcc/src/runtime/refmap.c",
+            "external/nanoarrow/thirdparty/flatcc/src/runtime/verifier.c",
+        },
+    });
+    const nanoarrow_exe = b.addExecutable(.{
+        .name = "nanoarrow-differential",
+        .root_module = nanoarrow_module,
+    });
+    const run_nanoarrow = b.addRunArtifact(nanoarrow_exe);
+    run_nanoarrow.setCwd(b.path("."));
+    const nanoarrow_step = b.step("interop-nanoarrow", "Run the differential IPC test against nanoarrow");
+    nanoarrow_step.dependOn(&run_nanoarrow.step);
+
     // Generate API documentation from the library root module (src/lib.zig).
     const docs_step = b.step("docs", "Generate API documentation");
     const install_docs = b.addInstallDirectory(.{

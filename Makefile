@@ -19,7 +19,7 @@ SHELL         := /usr/bin/env bash
 # Targets
 ################################################################################
 
-.PHONY: all build rebuild test format docs docs-serve clean release help shell setup-hooks test-hooks c-api interop corpus
+.PHONY: all build rebuild test format docs docs-serve clean release help shell setup-hooks test-hooks c-api interop corpus interop-nanoarrow
 .DEFAULT_GOAL := help
 
 help: ## Show the help messages for all targets
@@ -52,6 +52,14 @@ interop: c-api ## Round-trip the C Data Interface and the IPC stream against pya
 corpus: ## Run the arrow-testing IPC fuzz corpus through the IPC readers (skips if the submodule is absent)
 	@echo "Running the arrow-testing IPC fuzz-regression corpus..."
 	$(ZIG) build corpus-check $(BUILD_OPTS) -j$(JOBS)
+
+interop-nanoarrow: ## Run the differential IPC test against nanoarrow (skips if the submodule is absent)
+	@if [ ! -f external/nanoarrow/src/nanoarrow/nanoarrow.h ]; then \
+		echo "SKIP: nanoarrow submodule not initialized; run 'git submodule update --init'"; \
+	else \
+		echo "Running the nanoarrow IPC differential test..."; \
+		$(ZIG) build interop-nanoarrow $(BUILD_OPTS) -j$(JOBS); \
+	fi
 
 release: ## Build in Release mode
 	@echo "Building the project in Release mode..."
