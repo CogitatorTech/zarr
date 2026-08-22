@@ -31,12 +31,14 @@ const corpus_dirs = [_][]const u8{
 
 const max_file_size = 64 * 1024 * 1024;
 
+const PointColumn = zarr.StructArray(&.{ zarr.PrimitiveArray(f64), zarr.Utf8Array });
 const SampleColumns = zarr.StructArray(&.{
     zarr.PrimitiveArray(i32),
     zarr.BooleanArray,
     zarr.Utf8Array,
     zarr.LargeUtf8Array,
     zarr.ListArray(zarr.PrimitiveArray(i64)),
+    PointColumn,
 });
 
 pub fn main() !u8 {
@@ -105,7 +107,14 @@ fn buildSampleSchema(allocator: std.mem.Allocator) !zarr.Schema {
     var list_type = try zarr.DataType.initList(allocator, .int64);
     defer list_type.deinit(allocator);
 
-    var fields: [5]zarr.Field = undefined;
+    var x = try zarr.Field.init(allocator, "x", .float64, false);
+    defer x.deinit(allocator);
+    var label = try zarr.Field.init(allocator, "label", .utf8, true);
+    defer label.deinit(allocator);
+    var point_type = try zarr.DataType.initStructFields(allocator, &.{ x, label });
+    defer point_type.deinit(allocator);
+
+    var fields: [6]zarr.Field = undefined;
     var built: usize = 0;
     defer for (fields[0..built]) |*f| f.deinit(allocator);
     fields[0] = try zarr.Field.init(allocator, "id", .int32, false);
@@ -118,11 +127,14 @@ fn buildSampleSchema(allocator: std.mem.Allocator) !zarr.Schema {
     built += 1;
     fields[4] = try zarr.Field.init(allocator, "tags", list_type, true);
     built += 1;
+    fields[5] = try zarr.Field.init(allocator, "point", point_type, true);
+    built += 1;
     return zarr.Schema.init(allocator, fields[0..]);
 }
 
-/// Rows: {1, true, "a", "x", [10, 20]}, {2, null, null, "yy", []},
-/// {3, false, "ccc", "zzz", null}.
+/// Rows: {1, true, "a", "x", [10, 20], {1.5, "a"}},
+/// {2, null, null, "yy", [], null}, {3, false, "ccc", "zzz", null,
+/// {-2.25, null}}.
 fn buildSampleData(allocator: std.mem.Allocator) !zarr.ArrayData {
     var builder = SampleColumns.Builder.init(allocator);
     defer builder.deinit();
@@ -134,6 +146,9 @@ fn buildSampleData(allocator: std.mem.Allocator) !zarr.ArrayData {
     try builder.children[4].values.append(10);
     try builder.children[4].values.append(20);
     try builder.children[4].appendList();
+    try builder.children[5].children[0].append(1.5);
+    try builder.children[5].children[1].append("a");
+    try builder.children[5].append();
     try builder.append();
 
     try builder.children[0].append(2);
@@ -141,6 +156,7 @@ fn buildSampleData(allocator: std.mem.Allocator) !zarr.ArrayData {
     try builder.children[2].appendNull();
     try builder.children[3].append("yy");
     try builder.children[4].appendList();
+    try builder.children[5].appendNull();
     try builder.append();
 
     try builder.children[0].append(3);
@@ -148,6 +164,9 @@ fn buildSampleData(allocator: std.mem.Allocator) !zarr.ArrayData {
     try builder.children[2].append("ccc");
     try builder.children[3].append("zzz");
     try builder.children[4].appendNull();
+    try builder.children[5].children[0].append(-2.25);
+    try builder.children[5].children[1].appendNull();
+    try builder.children[5].append();
     try builder.append();
 
     var columns = try builder.finish();
@@ -180,6 +199,13 @@ fn verifySampleData(data: zarr.ArrayData) !void {
     if (!std.mem.eql(i32, tags.offsets(i32), &.{ 0, 2, 2, 2 })) return error.ValueMismatch;
     if (tags.isValid(2)) return error.ValueMismatch;
     if (!std.mem.eql(i64, tags.child(0).values(i64), &.{ 10, 20 })) return error.ValueMismatch;
+
+    const points = data.child(5);
+    if (!points.isValid(0) or points.isValid(1) or !points.isValid(2)) return error.ValueMismatch;
+    if (points.child(0).values(f64)[0] != 1.5) return error.ValueMismatch;
+    if (points.child(0).values(f64)[2] != -2.25) return error.ValueMismatch;
+    if (!std.mem.eql(u8, points.child(1).valueBytes(0), "a")) return error.ValueMismatch;
+    if (points.child(1).isValid(2)) return error.ValueMismatch;
 }
 
 /// Reads every corpus stream with both libraries and reports verdict

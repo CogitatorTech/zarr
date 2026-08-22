@@ -203,6 +203,27 @@ pub const DataType = union(enum) {
         };
     }
 
+    /// Layout equality: the same physical shape, ignoring child field names
+    /// and nullability. Used where one side cannot carry names, such as
+    /// checking a builder-derived column type against a schema field, whose
+    /// names are the authority.
+    pub fn equalsLayout(self: DataType, other: DataType) bool {
+        if (std.meta.activeTag(self) != std.meta.activeTag(other)) return false;
+        return switch (self) {
+            .timestamp => |unit| unit == other.timestamp,
+            .list => |child| child.data_type.equalsLayout(other.list.data_type),
+            .@"struct" => |fields| blk: {
+                const others = other.@"struct";
+                if (fields.len != others.len) break :blk false;
+                for (fields, others) |a, b| {
+                    if (!a.data_type.equalsLayout(b.data_type)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => true,
+        };
+    }
+
     /// True for types whose values live in a single fixed-width buffer.
     pub fn isFixedWidth(self: DataType) bool {
         return self.bitWidth() != null;

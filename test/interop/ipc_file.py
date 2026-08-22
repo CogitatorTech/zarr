@@ -32,7 +32,8 @@ EXPECTED_FLAGS = [True, None, False]
 EXPECTED_NAMES = ["a", None, "ccc"]
 EXPECTED_BIOS = ["x", "yy", "zzz"]
 EXPECTED_TAGS = [[1, 2], [], [3, 4, 5]]
-COLUMN_NAMES = ["id", "flag", "name", "bio", "tags"]
+EXPECTED_POINTS = [{"x": 1.5, "label": "a"}, None, {"x": -2.25, "label": None}]
+COLUMN_NAMES = ["id", "flag", "name", "bio", "tags", "point"]
 
 
 def build_schema():
@@ -43,6 +44,7 @@ def build_schema():
             pa.field("name", pa.utf8(), nullable=True),
             pa.field("bio", pa.large_utf8(), nullable=False),
             pa.field("tags", pa.list_(pa.int32()), nullable=False),
+            pa.field("point", pa.struct([pa.field("x", pa.float64(), nullable=False), pa.field("label", pa.utf8())]), nullable=True),
         ]
     )
 
@@ -55,6 +57,7 @@ def build_reference():
             pa.array(EXPECTED_NAMES, type=pa.utf8()),
             pa.array(EXPECTED_BIOS, type=pa.large_utf8()),
             pa.array(EXPECTED_TAGS, type=pa.list_(pa.int32())),
+            pa.array(EXPECTED_POINTS, type=pa.struct([pa.field("x", pa.float64(), nullable=False), pa.field("label", pa.utf8())])),
         ],
         schema=build_schema(),
     )
@@ -90,6 +93,7 @@ def main():
         EXPECTED_NAMES,
         EXPECTED_BIOS,
         EXPECTED_TAGS,
+        EXPECTED_POINTS,
     ]
 
     # Direction 1: Zarr encodes the file, pyarrow opens it.

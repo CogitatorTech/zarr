@@ -17,23 +17,27 @@
 //! - `name`: `utf8`, `["a", null, "ccc"]` (32-bit-offset variable length).
 //! - `bio`: `large_utf8`, `["x", "yy", "zzz"]` (64-bit-offset variable length).
 //! - `tags`: `list<int32>`, `[[1, 2], [], [3, 4, 5]]` (nested offsets and child).
+//! - `point`: `struct<x: float64 not null, label: utf8>`,
+//!   `[{1.5, "a"}, null, {-2.25, null}]` (named fields, a struct-level null,
+//!   and a child-level null under a valid row).
 //!
-//! Timestamp and struct columns are left out on purpose: a batch builder always
-//! stamps a primitive column with its storage type, so a `timestamp` logical
-//! type cannot ride through it, and a struct `DataType` carries no field names,
-//! so a struct column's inner fields would export unnamed.
+//! A timestamp column is left out on purpose: a batch builder always stamps a
+//! primitive column with its storage type, so a `timestamp` logical type
+//! cannot ride through it.
 
 const std = @import("std");
 const zarr = @import("zarr");
 
 const ArrowSchema = zarr.c_data.ArrowSchema;
 const ArrowArray = zarr.c_data.ArrowArray;
+const PointColumn = zarr.StructArray(&.{ zarr.PrimitiveArray(f64), zarr.Utf8Array });
 const SampleBatch = zarr.RecordBatch(&[_]type{
     zarr.PrimitiveArray(i32),
     zarr.BooleanArray,
     zarr.Utf8Array,
     zarr.LargeUtf8Array,
     zarr.ListArray(zarr.PrimitiveArray(i32)),
+    PointColumn,
 });
 
 /// The allocator backing every export. It is captured in the exported release
@@ -47,6 +51,8 @@ const expected_flags = [row_count]?bool{ true, null, false };
 const expected_names = [row_count]?[]const u8{ "a", null, "ccc" };
 const expected_bios = [row_count][]const u8{ "x", "yy", "zzz" };
 const expected_tags = [row_count][]const i32{ &.{ 1, 2 }, &.{}, &.{ 3, 4, 5 } };
+const Point = struct { x: f64, label: ?[]const u8 };
+const expected_points = [row_count]?Point{ .{ .x = 1.5, .label = "a" }, null, .{ .x = -2.25, .label = null } };
 
 /// Fill the caller-allocated `ArrowSchema` and `ArrowArray` at the given
 /// addresses with the sample record batch. Returns 0 on success, 1 on failure.
@@ -199,7 +205,14 @@ fn buildSchema() !zarr.Schema {
     var list_type = try zarr.DataType.initList(allocator, .int32);
     defer list_type.deinit(allocator);
 
-    var fields: [5]zarr.Field = undefined;
+    var x = try zarr.Field.init(allocator, "x", .float64, false);
+    defer x.deinit(allocator);
+    var label = try zarr.Field.init(allocator, "label", .utf8, true);
+    defer label.deinit(allocator);
+    var point_type = try zarr.DataType.initStructFields(allocator, &.{ x, label });
+    defer point_type.deinit(allocator);
+
+    var fields: [6]zarr.Field = undefined;
     var built: usize = 0;
     defer for (fields[0..built]) |*f| f.deinit(allocator);
     fields[0] = try zarr.Field.init(allocator, "id", .int32, false);
@@ -211,6 +224,8 @@ fn buildSchema() !zarr.Schema {
     fields[3] = try zarr.Field.init(allocator, "bio", .large_utf8, false);
     built += 1;
     fields[4] = try zarr.Field.init(allocator, "tags", list_type, false);
+    built += 1;
+    fields[5] = try zarr.Field.init(allocator, "point", point_type, true);
     built += 1;
 
     return zarr.Schema.init(allocator, fields[0..]);
@@ -226,6 +241,13 @@ fn buildBatch(schema: zarr.Schema) !SampleBatch {
         try builder.children[3].append(expected_bios[i]);
         for (expected_tags[i]) |element| try builder.children[4].values.append(element);
         try builder.children[4].appendList();
+        if (expected_points[i]) |p| {
+            try builder.children[5].children[0].append(p.x);
+            if (p.label) |v| try builder.children[5].children[1].append(v) else try builder.children[5].children[1].appendNull();
+            try builder.children[5].append();
+        } else {
+            try builder.children[5].appendNull();
+        }
         try builder.append();
     }
     var columns = try builder.finish();
@@ -240,6 +262,7 @@ fn batchMatchesSample(batch: SampleBatch) bool {
     const names = batch.column(2);
     const bios = batch.column(3);
     const tags = batch.column(4);
+    const points = batch.column(5);
     for (0..row_count) |i| {
         if (ids.get(i) != @as(?i32, expected_ids[i])) return false;
         if (!optBoolEq(flags.get(i), expected_flags[i])) return false;
@@ -249,6 +272,13 @@ fn batchMatchesSample(batch: SampleBatch) bool {
         const base = tags.valueOffset(i);
         for (expected_tags[i], 0..) |element, j| {
             if (tags.values.get(base + j) != @as(?i32, element)) return false;
+        }
+        if (expected_points[i]) |p| {
+            if (!points.isValid(i)) return false;
+            if (points.field(0).get(i) != @as(?f64, p.x)) return false;
+            if (!optBytesEq(points.field(1).get(i), p.label)) return false;
+        } else if (points.isValid(i)) {
+            return false;
         }
     }
     return true;
