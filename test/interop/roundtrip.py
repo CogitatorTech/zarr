@@ -78,6 +78,10 @@ def main():
     lib.zarr_verify_sample_batch.restype = ctypes.c_int
     lib.zarr_verify_sample_batch_slice.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
     lib.zarr_verify_sample_batch_slice.restype = ctypes.c_int
+    lib.zarr_export_dict_column.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
+    lib.zarr_export_dict_column.restype = ctypes.c_int
+    lib.zarr_verify_dict_column.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
+    lib.zarr_verify_dict_column.restype = ctypes.c_int
 
     # Compare by value, not by full schema equality: field names on nested
     # children and nullability metadata are not what this test asserts.
@@ -120,6 +124,28 @@ def main():
     rc = lib.zarr_verify_sample_batch_slice(addr(c_schema3), addr(c_array3))
     assert rc == 0, f"zarr_verify_sample_batch_slice returned {rc}"
     print("PASS: pyarrow sliced export -> Zarr import")
+
+    # Direction 4: Zarr exports a dictionary-encoded column, pyarrow decodes it.
+    c_schema4 = ffi.new("struct ArrowSchema*")
+    c_array4 = ffi.new("struct ArrowArray*")
+    rc = lib.zarr_export_dict_column(addr(c_schema4), addr(c_array4))
+    assert rc == 0, f"zarr_export_dict_column returned {rc}"
+    dict_col = pa.Array._import_from_c(addr(c_array4), addr(c_schema4))
+    assert dict_col.type == pa.dictionary(pa.int8(), pa.utf8()), dict_col.type
+    assert dict_col.to_pylist() == ["red", "green", None, "blue", "red"], dict_col.to_pylist()
+    print("PASS: Zarr dictionary export -> pyarrow import")
+
+    # Direction 5: pyarrow exports a dictionary-encoded column, Zarr verifies it.
+    dict_out = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, None, 2, 0], type=pa.int8()),
+        pa.array(["red", "green", "blue"]),
+    )
+    c_schema5 = ffi.new("struct ArrowSchema*")
+    c_array5 = ffi.new("struct ArrowArray*")
+    dict_out._export_to_c(addr(c_array5), addr(c_schema5))
+    rc = lib.zarr_verify_dict_column(addr(c_schema5), addr(c_array5))
+    assert rc == 0, f"zarr_verify_dict_column returned {rc}"
+    print("PASS: pyarrow dictionary export -> Zarr import")
 
     print(f"OK: C Data Interface round-trip verified against pyarrow {pa.__version__}")
     return 0

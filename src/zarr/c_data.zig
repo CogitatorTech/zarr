@@ -83,6 +83,7 @@ const ArrayPrivate = struct {
     data: ArrayData,
     buffers: []?*const anyopaque,
     children: []*ArrowArray,
+    dictionary: ?*ArrowArray = null,
 };
 
 /// The Arrow C Data Interface format string for `data_type`. The returned slice
@@ -137,9 +138,11 @@ pub fn formatString(data_type: DataType) [:0]const u8 {
             .nanosecond => "tDn",
         },
         // Decimal and fixed-size formats embed their parameters, so
-        // `exportSchemaNamed` builds them as owned strings. Dictionary export
-        // over the C interface is not implemented yet.
-        .decimal128, .decimal256, .fixed_size_binary, .fixed_size_list, .dictionary => unreachable,
+        // `exportSchemaNamed` builds them as owned strings.
+        .decimal128, .decimal256, .fixed_size_binary, .fixed_size_list => unreachable,
+        // A dictionary schema's main format is the index type's format; the
+        // value type rides the dictionary child schema.
+        .dictionary => |d| formatString(d.index.*),
         .list => "+l",
         .@"struct" => "+s",
     };
@@ -273,6 +276,18 @@ fn exportSchemaNamed(allocator: Allocator, data_type: DataType, name: ?[]const u
         allocator.free(cptr[0..n]);
     };
 
+    var dict_schema: ?*ArrowSchema = null;
+    errdefer if (dict_schema) |ds| {
+        ds.release.?(ds);
+        allocator.destroy(ds);
+    };
+    if (data_type == .dictionary) {
+        const ds = try allocator.create(ArrowSchema);
+        errdefer allocator.destroy(ds);
+        try exportSchemaNamed(allocator, data_type.dictionary.value.*, "", true, ds);
+        dict_schema = ds;
+    }
+
     var owned_name: ?[:0]u8 = null;
     errdefer if (owned_name) |nm| allocator.free(nm);
     if (name) |nm| owned_name = try allocator.dupeZ(u8, nm);
@@ -297,10 +312,14 @@ fn exportSchemaNamed(allocator: Allocator, data_type: DataType, name: ?[]const u
         .format = if (owned_format) |f| f.ptr else formatString(data_type).ptr,
         .name = if (owned_name) |nm| nm.ptr else null,
         .metadata = null,
-        .flags = if (nullable) Flags.nullable else 0,
+        .flags = blk: {
+            var flags: i64 = if (nullable) Flags.nullable else 0;
+            if (data_type == .dictionary and data_type.dictionary.ordered) flags |= Flags.dictionary_ordered;
+            break :blk flags;
+        },
         .n_children = @intCast(n),
         .children = children,
-        .dictionary = null,
+        .dictionary = dict_schema,
         .release = releaseSchema,
         .private_data = priv,
     };
@@ -321,6 +340,10 @@ fn releaseSchema(schema: *ArrowSchema) callconv(.c) void {
             allocator.destroy(c);
         }
         allocator.free(cptr[0..n]);
+    }
+    if (schema.dictionary) |ds| {
+        if (ds.release) |rel| rel(ds);
+        allocator.destroy(ds);
     }
     if (priv.name) |nm| allocator.free(nm);
     if (priv.format) |f| allocator.free(f);
@@ -370,6 +393,18 @@ fn fillArrayNode(allocator: Allocator, src: *const ArrayData, out: *ArrowArray) 
         built += 1;
     }
 
+    var dict_node: ?*ArrowArray = null;
+    errdefer if (dict_node) |dn| {
+        dn.release.?(dn);
+        allocator.destroy(dn);
+    };
+    if (src.dictionary) |dict| {
+        const dn = try allocator.create(ArrowArray);
+        errdefer allocator.destroy(dn);
+        try fillArrayNode(allocator, dict, dn);
+        dict_node = dn;
+    }
+
     const priv = try allocator.create(ArrayPrivate);
     priv.* = .{
         .allocator = allocator,
@@ -377,6 +412,7 @@ fn fillArrayNode(allocator: Allocator, src: *const ArrayData, out: *ArrowArray) 
         .data = undefined,
         .buffers = buffers,
         .children = children,
+        .dictionary = dict_node,
     };
 
     out.* = .{
@@ -387,7 +423,7 @@ fn fillArrayNode(allocator: Allocator, src: *const ArrayData, out: *ArrowArray) 
         .n_children = @intCast(nc),
         .buffers = if (nb > 0) buffers.ptr else null,
         .children = if (nc > 0) children.ptr else null,
-        .dictionary = null,
+        .dictionary = dict_node,
         .release = releaseArray,
         .private_data = priv,
     };
@@ -405,6 +441,10 @@ fn releaseArray(array: *ArrowArray) callconv(.c) void {
         allocator.destroy(c);
     }
     allocator.free(priv.children);
+    if (priv.dictionary) |dn| {
+        if (dn.release) |rel| rel(dn);
+        allocator.destroy(dn);
+    }
     allocator.free(priv.buffers);
     // Root only: free every buffer's bytes. Children borrow them, so this runs
     // after their plumbing is already released.
@@ -422,6 +462,32 @@ pub const ImportError = error{ UnsupportedFormat, InvalidFormat } || Allocator.E
 /// callback. The returned type is owned by the caller and released with
 /// `deinit`.
 pub fn importSchema(allocator: Allocator, schema: *const ArrowSchema) ImportError!DataType {
+    var next_id: i64 = 0;
+    return importSchemaWithIds(allocator, schema, &next_id);
+}
+
+/// `importSchema` with an id counter: the C interface carries no dictionary
+/// ids, so the import assigns fresh sequential ones, unique per top-level
+/// import call.
+fn importSchemaWithIds(allocator: Allocator, schema: *const ArrowSchema, next_id: *i64) ImportError!DataType {
+    var base = try importSchemaFormat(allocator, schema, next_id);
+    if (schema.dictionary) |dict_schema| {
+        errdefer base.deinit(allocator);
+        switch (base) {
+            .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64 => {},
+            else => return error.InvalidFormat,
+        }
+        const id = next_id.*;
+        next_id.* += 1;
+        var value_type = try importSchemaWithIds(allocator, dict_schema, next_id);
+        defer value_type.deinit(allocator);
+        const ordered = (schema.flags & Flags.dictionary_ordered) != 0;
+        return DataType.initDictionary(allocator, id, base, value_type, ordered);
+    }
+    return base;
+}
+
+fn importSchemaFormat(allocator: Allocator, schema: *const ArrowSchema, next_id: *i64) ImportError!DataType {
     const fmt = std.mem.span(schema.format);
     const eq = struct {
         fn f(a: []const u8, b: []const u8) bool {
@@ -500,7 +566,7 @@ pub fn importSchema(allocator: Allocator, schema: *const ArrowSchema) ImportErro
         const size = std.fmt.parseInt(i32, fmt[3..], 10) catch return error.InvalidFormat;
         if (size < 0) return error.InvalidFormat;
         if (schema.n_children != 1 or schema.children == null) return error.InvalidFormat;
-        var child = try importField(allocator, schema.children.?[0]);
+        var child = try importFieldWithIds(allocator, schema.children.?[0], next_id);
         defer child.deinit(allocator);
         return DataType.initFixedSizeListField(allocator, child, size);
     }
@@ -512,7 +578,7 @@ pub fn importSchema(allocator: Allocator, schema: *const ArrowSchema) ImportErro
 
     if (eq(fmt, "+l")) {
         if (schema.n_children != 1 or schema.children == null) return error.InvalidFormat;
-        var child = try importField(allocator, schema.children.?[0]);
+        var child = try importFieldWithIds(allocator, schema.children.?[0], next_id);
         defer child.deinit(allocator);
         return DataType.initListField(allocator, child);
     }
@@ -527,7 +593,7 @@ pub fn importSchema(allocator: Allocator, schema: *const ArrowSchema) ImportErro
             allocator.free(fields);
         }
         for (0..n) |i| {
-            fields[i] = try importField(allocator, schema.children.?[i]);
+            fields[i] = try importFieldWithIds(allocator, schema.children.?[i], next_id);
             built += 1;
         }
         return DataType.initStructFields(allocator, fields);
@@ -542,7 +608,12 @@ pub fn importSchema(allocator: Allocator, schema: *const ArrowSchema) ImportErro
 /// the caller keeps ownership and the release callback. The returned field is
 /// owned by the caller and released with `deinit`.
 pub fn importField(allocator: Allocator, schema: *const ArrowSchema) ImportError!Field {
-    var dt = try importSchema(allocator, schema);
+    var next_id: i64 = 0;
+    return importFieldWithIds(allocator, schema, &next_id);
+}
+
+fn importFieldWithIds(allocator: Allocator, schema: *const ArrowSchema, next_id: *i64) ImportError!Field {
+    var dt = try importSchemaWithIds(allocator, schema, next_id);
     errdefer dt.deinit(allocator);
     const name = if (schema.name) |n| std.mem.span(n) else "";
     const owned_name = try allocator.dupe(u8, name);
@@ -567,8 +638,9 @@ pub fn importSchemaFields(allocator: Allocator, c_schema: *const ArrowSchema) Im
         for (fields[0..built]) |*f| f.deinit(allocator);
         allocator.free(fields);
     }
+    var next_id: i64 = 0;
     for (0..n) |i| {
-        fields[i] = try importField(allocator, c_schema.children.?[i]);
+        fields[i] = try importFieldWithIds(allocator, c_schema.children.?[i], &next_id);
         built += 1;
     }
     // Schema's field slice is public; construct directly to keep the fields we
@@ -625,6 +697,8 @@ fn importArraySlice(
         for (buffers) |*b| if (b.*) |*buf| buf.deinit();
         allocator.free(buffers);
     }
+    var dictionary_values: ?ArrayData = null;
+    errdefer if (dictionary_values) |*dv| dv.deinit();
     const children = try allocator.alloc(ArrayData, n_children);
     var built_children: usize = 0;
     errdefer {
@@ -669,8 +743,16 @@ fn importArraySlice(
             children[0] = try importArraySlice(allocator, fsl.child.data_type, array.children.?[0], total * size, length * size);
             built_children = 1;
         },
-        // Dictionary import over the C interface is not implemented yet.
-        .dictionary => return error.InvalidFormat,
+        .dictionary => |d| {
+            // Indices slice like any fixed-width buffer; the dictionary
+            // values are shared and never sliced.
+            const width = d.index.bitWidth().? / 8;
+            const src = bufferAt(array, 1) orelse return error.InvalidFormat;
+            buffers[1] = try Buffer.dupe(allocator, src[total * width ..][0 .. length * width]);
+            const dict_array = array.dictionary orelse return error.InvalidFormat;
+            if (dict_array.length < 0) return error.InvalidFormat;
+            dictionary_values = try importArraySlice(allocator, d.value.*, dict_array, 0, @intCast(dict_array.length));
+        },
         else => {
             const width = data_type.bitWidth().? / 8;
             const src = bufferAt(array, 1) orelse return error.InvalidFormat;
@@ -689,6 +771,23 @@ fn importArraySlice(
 
     var dt = try data_type.clone(allocator);
     errdefer dt.deinit(allocator);
+
+    if (dictionary_values) |dv| {
+        const holder = try allocator.create(ArrayData);
+        holder.* = dv;
+        dictionary_values = null; // owned by the result from here
+        // Constructed as a literal, like the IPC batch decoder; the deep
+        // validation in `importArray` covers it.
+        return .{
+            .allocator = allocator,
+            .data_type = dt,
+            .length = length,
+            .null_count = null_count,
+            .buffers = buffers,
+            .children = children,
+            .dictionary = holder,
+        };
+    }
 
     // Counts and child types are correct by construction, so `init` cannot
     // fail; `importArray` runs the deep validation afterwards.
@@ -1326,6 +1425,122 @@ test "a zoned timestamp round-trips through the C schema" {
     defer back.deinit(allocator);
     try testing.expect(back.equals(zoned));
     try testing.expectEqualStrings("Europe/Paris", back.timestamp.timezone.?);
+}
+
+/// A hand-built dictionary array: indices [0, 1, null, 2, 0] (int8) into
+/// ["red", "green", "blue"].
+fn buildDictionaryData(allocator: Allocator) !ArrayData {
+    var offsets = try Buffer.alloc(allocator, 4 * @sizeOf(i32));
+    const off = offsets.items(i32);
+    off[0] = 0;
+    off[1] = 3;
+    off[2] = 8;
+    off[3] = 12;
+    const values = try Buffer.dupe(allocator, "redgreenblue");
+    const dict_buffers = try allocator.alloc(?Buffer, 3);
+    dict_buffers[0] = null;
+    dict_buffers[1] = offsets;
+    dict_buffers[2] = values;
+    const dict_values = try ArrayData.init(allocator, .utf8, 3, 0, dict_buffers, try allocator.alloc(ArrayData, 0));
+
+    var indices = try Buffer.alloc(allocator, 5);
+    const idx = indices.items(i8);
+    idx[0] = 0;
+    idx[1] = 1;
+    idx[2] = 0;
+    idx[3] = 2;
+    idx[4] = 0;
+    var validity = try Buffer.allocZeroed(allocator, 1);
+    validity.data[0] = 0b11011;
+    const buffers = try allocator.alloc(?Buffer, 2);
+    buffers[0] = validity;
+    buffers[1] = indices;
+    const dict_type = try DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    return ArrayData.initDictionary(allocator, dict_type, 5, 1, buffers, dict_values);
+}
+
+test "a dictionary array round-trips through the C interface" {
+    const allocator = testing.allocator;
+
+    var dict_type = try DataType.initDictionary(allocator, 0, .int8, .utf8, true);
+    defer dict_type.deinit(allocator);
+    var cs: ArrowSchema = undefined;
+    try exportSchema(allocator, dict_type, &cs);
+    defer cs.release.?(&cs);
+
+    // The main format is the index type; the value type rides the
+    // dictionary child schema, and ordering rides the flags.
+    try testing.expectEqualStrings("c", std.mem.span(cs.format));
+    try testing.expect(cs.dictionary != null);
+    try testing.expectEqualStrings("u", std.mem.span(cs.dictionary.?.format));
+    try testing.expect(cs.flags & Flags.dictionary_ordered != 0);
+
+    var back = try importSchema(allocator, &cs);
+    defer back.deinit(allocator);
+    try testing.expect(back.equals(dict_type));
+
+    // exportArray takes ownership of the data; its release frees it.
+    const data = try buildDictionaryData(allocator);
+    var carray: ArrowArray = undefined;
+    try exportArray(allocator, data, &carray);
+    defer carray.release.?(&carray);
+
+    try testing.expectEqual(@as(i64, 5), carray.length);
+    try testing.expect(carray.dictionary != null);
+    try testing.expectEqual(@as(i64, 3), carray.dictionary.?.length);
+
+    var imported = try importArray(allocator, back, &carray);
+    defer imported.deinit();
+    try imported.validateFull();
+    try testing.expectEqualSlices(i8, &.{ 0, 1, 0, 2, 0 }, imported.values(i8));
+    try testing.expect(!imported.isValid(2));
+    try testing.expectEqualStrings("red", imported.dictionary.?.valueBytes(0));
+    try testing.expectEqualStrings("blue", imported.dictionary.?.valueBytes(2));
+}
+
+test "importing a sliced dictionary array slices only the indices" {
+    const allocator = testing.allocator;
+
+    var dict_type = try DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    defer dict_type.deinit(allocator);
+    const data = try buildDictionaryData(allocator);
+    var carray: ArrowArray = undefined;
+    try exportArray(allocator, data, &carray);
+    defer carray.release.?(&carray);
+
+    carray.offset = 3;
+    carray.length = 2;
+    carray.null_count = -1;
+    var imported = try importArray(allocator, dict_type, &carray);
+    defer imported.deinit();
+
+    try testing.expectEqualSlices(i8, &.{ 2, 0 }, imported.values(i8));
+    try testing.expectEqual(@as(usize, 0), imported.null_count);
+    // The dictionary itself is shared, never sliced.
+    try testing.expectEqual(@as(usize, 3), imported.dictionary.?.length);
+}
+
+test "imported dictionary fields get distinct ids" {
+    const allocator = testing.allocator;
+    var a_type = try DataType.initDictionary(allocator, 9, .int8, .utf8, false);
+    defer a_type.deinit(allocator);
+    var b_type = try DataType.initDictionary(allocator, 9, .int16, .int32, false);
+    defer b_type.deinit(allocator);
+    var a = try Field.init(allocator, "a", a_type, true);
+    defer a.deinit(allocator);
+    var b = try Field.init(allocator, "b", b_type, true);
+    defer b.deinit(allocator);
+    var schema = try Schema.init(allocator, &.{ a, b });
+    defer schema.deinit(allocator);
+
+    var cs: ArrowSchema = undefined;
+    try exportSchemaFields(allocator, schema, &cs);
+    defer cs.release.?(&cs);
+
+    var back = try importSchemaFields(allocator, &cs);
+    defer back.deinit(allocator);
+    // The C interface carries no ids; the import assigns fresh distinct ones.
+    try testing.expect(back.field(0).data_type.dictionary.id != back.field(1).data_type.dictionary.id);
 }
 
 test "export and import a field carry the name and nullability" {

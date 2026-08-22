@@ -207,6 +207,91 @@ export fn zarr_verify_sample_batch_slice(schema_addr: usize, array_addr: usize) 
     return if (batchMatchesSampleRows(batch, 1, 2)) 0 else 1;
 }
 
+/// Fill the caller-allocated structs with a dictionary-encoded column:
+/// indices [0, 1, null, 2, 0] (int8) into ["red", "green", "blue"]. Returns 0
+/// on success, 1 on failure.
+export fn zarr_export_dict_column(schema_addr: usize, array_addr: usize) c_int {
+    const out_schema: *ArrowSchema = @ptrFromInt(schema_addr);
+    const out_array: *ArrowArray = @ptrFromInt(array_addr);
+    exportDictColumn(out_schema, out_array) catch return 1;
+    return 0;
+}
+
+fn exportDictColumn(out_schema: *ArrowSchema, out_array: *ArrowArray) !void {
+    var dict_type = try zarr.DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    defer dict_type.deinit(allocator);
+    try zarr.c_data.exportSchema(allocator, dict_type, out_schema);
+    errdefer out_schema.release.?(out_schema);
+    const data = try buildDictData();
+    try zarr.c_data.exportArray(allocator, data, out_array);
+}
+
+fn buildDictData() !zarr.ArrayData {
+    const Buffer = zarr.Buffer;
+    var offsets = try Buffer.alloc(allocator, 4 * @sizeOf(i32));
+    const off = offsets.items(i32);
+    off[0] = 0;
+    off[1] = 3;
+    off[2] = 8;
+    off[3] = 12;
+    const values = try Buffer.dupe(allocator, "redgreenblue");
+    const dict_buffers = try allocator.alloc(?Buffer, 3);
+    dict_buffers[0] = null;
+    dict_buffers[1] = offsets;
+    dict_buffers[2] = values;
+    const dict_values = try zarr.ArrayData.init(allocator, .utf8, 3, 0, dict_buffers, try allocator.alloc(zarr.ArrayData, 0));
+
+    var indices = try Buffer.alloc(allocator, 5);
+    const idx = indices.items(i8);
+    idx[0] = 0;
+    idx[1] = 1;
+    idx[2] = 0;
+    idx[3] = 2;
+    idx[4] = 0;
+    var validity = try Buffer.allocZeroed(allocator, 1);
+    validity.data[0] = 0b11011;
+    const buffers = try allocator.alloc(?Buffer, 2);
+    buffers[0] = validity;
+    buffers[1] = indices;
+    const dict_type = try zarr.DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    return zarr.ArrayData.initDictionary(allocator, dict_type, 5, 1, buffers, dict_values);
+}
+
+/// Import the structs at the given addresses, release them, and check the
+/// column equals the dictionary sample above. Returns 0 on a match, 1 on a
+/// mismatch, and 2 when the import itself fails.
+export fn zarr_verify_dict_column(schema_addr: usize, array_addr: usize) c_int {
+    const in_schema: *ArrowSchema = @ptrFromInt(schema_addr);
+    const in_array: *ArrowArray = @ptrFromInt(array_addr);
+    const matched = verifyDictColumn(in_schema, in_array) catch {
+        releaseBoth(in_schema, in_array);
+        return 2;
+    };
+    releaseBoth(in_schema, in_array);
+    return if (matched) 0 else 1;
+}
+
+fn verifyDictColumn(in_schema: *const ArrowSchema, in_array: *const ArrowArray) !bool {
+    var dt = try zarr.c_data.importSchema(allocator, in_schema);
+    defer dt.deinit(allocator);
+    if (dt != .dictionary) return false;
+    if (!dt.dictionary.index.equals(.int8) or !dt.dictionary.value.equals(.utf8)) return false;
+
+    var data = try zarr.c_data.importArray(allocator, dt, in_array);
+    defer data.deinit();
+    if (data.length != 5) return false;
+    // Element 2 is null; its index byte is undefined and not compared.
+    const idx = data.values(i8);
+    if (idx[0] != 0 or idx[1] != 1 or idx[3] != 2 or idx[4] != 0) return false;
+    if (data.isValid(2) or !data.isValid(0) or !data.isValid(4)) return false;
+    const dict = data.dictionary.?;
+    if (dict.length != 3) return false;
+    if (!std.mem.eql(u8, dict.valueBytes(0), "red")) return false;
+    if (!std.mem.eql(u8, dict.valueBytes(1), "green")) return false;
+    if (!std.mem.eql(u8, dict.valueBytes(2), "blue")) return false;
+    return true;
+}
+
 fn releaseBoth(schema: *ArrowSchema, array: *ArrowArray) void {
     if (array.release) |release| release(array);
     if (schema.release) |release| release(schema);
@@ -346,6 +431,13 @@ test "a sliced sample batch verifies through the C API entry points" {
     array.length = 2;
     array.null_count = -1;
     try std.testing.expectEqual(@as(c_int, 0), zarr_verify_sample_batch_slice(@intFromPtr(&schema), @intFromPtr(&array)));
+}
+
+test "the dictionary column round-trips through the C API entry points" {
+    var schema: ArrowSchema = undefined;
+    var array: ArrowArray = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), zarr_export_dict_column(@intFromPtr(&schema), @intFromPtr(&array)));
+    try std.testing.expectEqual(@as(c_int, 0), zarr_verify_dict_column(@intFromPtr(&schema), @intFromPtr(&array)));
 }
 
 test "sample batch round-trips through the C API entry points" {

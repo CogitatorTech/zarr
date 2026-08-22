@@ -93,11 +93,12 @@ The memory model, the array layer, schema, and record batches are in place, alon
 type round-trips through. The C Data Interface (`src/zarr/c_data.zig`) exports and imports types, fields, arrays, and record batches. IPC is in place under
 `src/zarr/ipc/`: a minimal FlatBuffers runtime, message framing, schema and record batch serialization, and the stream and file formats. Both the C Data
 Interface and IPC are interop-proven against pyarrow in both directions. `make interop` runs the scripts under `test/interop/`, and fixture tests inside the
-IPC modules pin pyarrow-written bytes without a network or Python dependency. Not yet implemented: dictionary deltas, body compression, the C interface for dictionary types, and the spec types
+IPC modules pin pyarrow-written bytes without a network or Python dependency. Not yet implemented: dictionary deltas, body compression, and the spec types
 missing from `DataType`: interval, map, union, and the view layouts. Readers report these as unsupported errors instead of guessing.
 Temporal coverage is complete (date, time, duration, and timestamps with or without a timezone), and so are decimals and the fixed-size layouts.
-Dictionary-encoded data flows both ways over IPC: readers collect dictionary batches and attach values to columns, and writers emit each dictionary
-once before the first batch that uses it, for streams and files alike.
+Dictionary-encoded data flows both ways over IPC and the C Data Interface: IPC readers collect dictionary batches and attach values to columns,
+IPC writers emit each dictionary once before the first batch that uses it, and the C interface carries indices with a dictionary child, assigning
+fresh ids on import since the C ABI has none.
 
 ## Zig Conventions
 
