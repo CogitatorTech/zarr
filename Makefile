@@ -46,6 +46,8 @@ interop: c-api ## Round-trip the C Data Interface and the IPC stream against pya
 	uv run python test/interop/roundtrip.py
 	@echo "Running the pyarrow IPC stream round-trip..."
 	uv run python test/interop/ipc_stream.py
+	@echo "Running the pyarrow IPC file round-trip..."
+	uv run python test/interop/ipc_file.py
 
 release: ## Build in Release mode
 	@echo "Building the project in Release mode..."

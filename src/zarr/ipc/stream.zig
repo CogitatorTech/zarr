@@ -182,21 +182,39 @@ pub const StreamReader = struct {
         const body_len: usize = @intCast(body_length);
         if (envelope.body.len < body_len) return error.Truncated;
 
-        switch (msg.readScalar(u8, message_slot_header_tag, 0)) {
-            header_record_batch => {},
-            header_schema => return error.UnexpectedMessage,
-            else => return error.UnsupportedMessage,
-        }
-        const header = msg.readTable(message_slot_header) orelse return error.MalformedBatch;
-        const data = try batch.readRecordBatch(self.allocator, header, self.column_type, envelope.body[0..body_len]);
+        const data = try decodeBatchMessage(self.allocator, self.bytes[self.pos..], self.column_type);
         self.pos += 8 + envelope.metadata.len + body_len;
         return data;
     }
 };
 
+/// Decodes one encapsulated record batch message at the start of `bytes` into
+/// the struct-typed columns it holds. `column_type` is the struct type over
+/// the schema's column types, as `columnTypeOf` builds. Used by the stream
+/// reader for the next message and by the file reader for random access. The
+/// caller owns the returned data.
+pub fn decodeBatchMessage(allocator: Allocator, bytes: []const u8, column_type: DataType) DecodeError!ArrayData {
+    const envelope = try message.decode(bytes);
+    if (envelope.metadata.len == 0) return error.UnexpectedMessage;
+    const msg = flatbuffers.getRoot(envelope.metadata);
+
+    const body_length = msg.readScalar(i64, message_slot_body_length, 0);
+    if (body_length < 0) return error.Truncated;
+    const body_len: usize = @intCast(body_length);
+    if (envelope.body.len < body_len) return error.Truncated;
+
+    switch (msg.readScalar(u8, message_slot_header_tag, 0)) {
+        header_record_batch => {},
+        header_schema => return error.UnexpectedMessage,
+        else => return error.UnsupportedMessage,
+    }
+    const header = msg.readTable(message_slot_header) orelse return error.MalformedBatch;
+    return batch.readRecordBatch(allocator, header, column_type, envelope.body[0..body_len]);
+}
+
 /// The struct type over a schema's column types, which is the shape of a
 /// batch's columns in erased form. The caller owns the returned type.
-fn columnTypeOf(allocator: Allocator, schema: Schema) Allocator.Error!DataType {
+pub fn columnTypeOf(allocator: Allocator, schema: Schema) Allocator.Error!DataType {
     const child_types = try allocator.alloc(DataType, schema.fields.len);
     defer allocator.free(child_types);
     for (schema.fields, 0..) |f, i| child_types[i] = f.data_type;

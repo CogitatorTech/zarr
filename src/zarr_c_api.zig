@@ -131,6 +131,57 @@ fn verifySampleStream(bytes: []const u8) !bool {
     return batchMatchesSample(batch);
 }
 
+/// Encode the sample record batch as an Arrow IPC file into the caller's
+/// buffer. Returns the number of bytes written, or -1 when encoding fails or
+/// the buffer is too small.
+export fn zarr_encode_sample_file(out_addr: usize, capacity: usize) isize {
+    const out: [*]u8 = @ptrFromInt(out_addr);
+    const bytes = encodeSampleFile() catch return -1;
+    defer allocator.free(bytes);
+    if (bytes.len > capacity) return -1;
+    @memcpy(out[0..bytes.len], bytes);
+    return @intCast(bytes.len);
+}
+
+fn encodeSampleFile() ![]u8 {
+    var schema = try buildSchema();
+    defer schema.deinit(allocator);
+    var batch = try buildBatch(schema);
+    defer batch.deinit();
+    var data = try batch.toData(allocator);
+    defer data.deinit();
+
+    var writer = try zarr.ipc_file.FileWriter.init(allocator, schema);
+    defer writer.deinit();
+    try writer.writeBatch(data);
+    return writer.finish();
+}
+
+/// Open an Arrow IPC file and check it holds exactly the sample: the sample
+/// schema and one batch with the sample values. Returns 0 on a match, 1 on a
+/// mismatch, and 2 when decoding fails.
+export fn zarr_verify_sample_file(bytes_addr: usize, len: usize) c_int {
+    const bytes = @as([*]const u8, @ptrFromInt(bytes_addr))[0..len];
+    const matches = verifySampleFile(bytes) catch return 2;
+    return if (matches) 0 else 1;
+}
+
+fn verifySampleFile(bytes: []const u8) !bool {
+    var expected_schema = try buildSchema();
+    defer expected_schema.deinit(allocator);
+
+    var reader = try zarr.ipc_file.FileReader.init(allocator, bytes);
+    defer reader.deinit();
+    if (!expected_schema.equals(reader.schema)) return false;
+    if (reader.batchCount() != 1) return false;
+
+    var data = try reader.readBatch(0);
+    defer data.deinit();
+    var batch = try SampleBatch.fromData(allocator, reader.schema, data);
+    defer batch.deinit();
+    return batchMatchesSample(batch);
+}
+
 fn releaseBoth(schema: *ArrowSchema, array: *ArrowArray) void {
     if (array.release) |release| release(array);
     if (schema.release) |release| release(schema);
@@ -220,6 +271,13 @@ test "sample stream round-trips through the C API entry points" {
     const written = zarr_encode_sample_stream(@intFromPtr(&buf), buf.len);
     try std.testing.expect(written > 0);
     try std.testing.expectEqual(@as(c_int, 0), zarr_verify_sample_stream(@intFromPtr(&buf), @intCast(written)));
+}
+
+test "sample file round-trips through the C API entry points" {
+    var buf: [4096]u8 = undefined;
+    const written = zarr_encode_sample_file(@intFromPtr(&buf), buf.len);
+    try std.testing.expect(written > 0);
+    try std.testing.expectEqual(@as(c_int, 0), zarr_verify_sample_file(@intFromPtr(&buf), @intCast(written)));
 }
 
 test "sample batch round-trips through the C API entry points" {
