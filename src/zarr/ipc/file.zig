@@ -55,20 +55,26 @@ pub const FileWriter = struct {
     /// One entry per batch message: offset, metadata length, and body length,
     /// written into the footer's record batch blocks.
     blocks: std.ArrayListUnmanaged(Block),
+    /// One entry per dictionary batch message, written into the footer's
+    /// dictionary blocks.
+    dictionary_blocks: std.ArrayListUnmanaged(Block),
+    /// Dictionary values already written, by id; kept to check that later
+    /// batches reuse them unchanged.
+    emitted: batch.Dictionaries,
     /// The file's schema, cloned at `init` and written again in the footer.
     schema: Schema,
 
-    const Block = struct { offset: i64, metadata_length: i32, body_length: i64 };
+    pub const Block = stream.MessageBlock;
 
-    /// Starts a file by writing the magic and the schema message. Writing
-    /// dictionary-encoded schemas is not implemented yet and is refused.
-    /// Release with `deinit`.
-    pub fn init(allocator: Allocator, schema: Schema) (Allocator.Error || error{UnsupportedType})!FileWriter {
-        if (stream.schemaUsesDictionaries(schema)) return error.UnsupportedType;
+    /// Starts a file by writing the magic and the schema message. Release
+    /// with `deinit`.
+    pub fn init(allocator: Allocator, schema: Schema) Allocator.Error!FileWriter {
         var self = FileWriter{
             .allocator = allocator,
             .buf = .empty,
             .blocks = .empty,
+            .dictionary_blocks = .empty,
+            .emitted = batch.Dictionaries.init(allocator),
             .schema = try schema.clone(allocator),
         };
         errdefer self.deinit();
@@ -84,6 +90,10 @@ pub const FileWriter = struct {
     pub fn deinit(self: *FileWriter) void {
         self.buf.deinit(self.allocator);
         self.blocks.deinit(self.allocator);
+        self.dictionary_blocks.deinit(self.allocator);
+        var it = self.emitted.valueIterator();
+        while (it.next()) |values| values.deinit();
+        self.emitted.deinit();
         self.schema.deinit(self.allocator);
         self.* = undefined;
     }
@@ -92,7 +102,12 @@ pub const FileWriter = struct {
     /// is the struct-typed columns of a batch, as produced by
     /// `RecordBatch.toData`, and must match the schema the file was started
     /// with; the caller keeps ownership.
-    pub fn writeBatch(self: *FileWriter, data: ArrayData) Allocator.Error!void {
+    pub fn writeBatch(self: *FileWriter, data: ArrayData) (Allocator.Error || error{UnsupportedType})!void {
+        // Dictionary batches the batch depends on come first, each recorded
+        // as a footer dictionary block.
+        for (data.children) |column| {
+            try stream.emitDictionariesRecorded(self.allocator, &self.buf, &self.emitted, column, &self.dictionary_blocks);
+        }
         const msg = try stream.encodeBatchMessage(self.allocator, data);
         defer self.allocator.free(msg);
         const body_length = batch.bodyLength(data);
@@ -114,22 +129,13 @@ pub const FileWriter = struct {
         var b = Builder.init(self.allocator);
         defer b.deinit();
         const schema_off = try ipc_schema.writeSchema(&b, self.schema);
-        try b.startVector(block_size, self.blocks.items.len, 8);
-        var i = self.blocks.items.len;
-        while (i > 0) {
-            i -= 1;
-            var bytes = [_]u8{0} ** block_size;
-            std.mem.writeInt(i64, bytes[0..8], self.blocks.items[i].offset, .little);
-            std.mem.writeInt(i32, bytes[8..12], self.blocks.items[i].metadata_length, .little);
-            // Bytes 12 to 16 are the struct's alignment padding.
-            std.mem.writeInt(i64, bytes[16..24], self.blocks.items[i].body_length, .little);
-            try b.pushStructBytes(&bytes);
-        }
-        const batches_off = try b.endVector(self.blocks.items.len);
+        const batches_off = try writeBlockVector(&b, self.blocks.items);
+        const dictionaries_off = try writeBlockVector(&b, self.dictionary_blocks.items);
 
         b.startTable();
         try b.addScalar(i16, footer_slot_version, metadata_version_v5, 0);
         try b.addOffset(footer_slot_schema, schema_off);
+        try b.addOffset(footer_slot_dictionaries, dictionaries_off);
         try b.addOffset(footer_slot_record_batches, batches_off);
         const footer = try b.finish(try b.endTable());
 
@@ -141,6 +147,22 @@ pub const FileWriter = struct {
         return self.buf.toOwnedSlice(self.allocator);
     }
 };
+
+/// Writes a vector of footer `Block` structs, last to first.
+fn writeBlockVector(b: *Builder, blocks: []const FileWriter.Block) Allocator.Error!flatbuffers.Offset {
+    try b.startVector(block_size, blocks.len, 8);
+    var i = blocks.len;
+    while (i > 0) {
+        i -= 1;
+        var bytes = [_]u8{0} ** block_size;
+        std.mem.writeInt(i64, bytes[0..8], blocks[i].offset, .little);
+        std.mem.writeInt(i32, bytes[8..12], blocks[i].metadata_length, .little);
+        // Bytes 12 to 16 are the struct's alignment padding.
+        std.mem.writeInt(i64, bytes[16..24], blocks[i].body_length, .little);
+        try b.pushStructBytes(&bytes);
+    }
+    return b.endVector(blocks.len);
+}
 
 /// `MetadataVersion.V5`, matching what the stream layer writes on messages.
 const metadata_version_v5: i16 = 4;
@@ -460,6 +482,78 @@ test "reader returns errors on corrupt file bytes instead of crashing" {
             data.deinit();
         }
     }
+}
+
+test "dictionary-encoded batches round-trip through the file" {
+    const allocator = testing.allocator;
+    const stream_tests = @import("stream.zig");
+    _ = stream_tests;
+
+    var dict_type = try DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    defer dict_type.deinit(allocator);
+    var category = try Field.init(allocator, "category", dict_type, true);
+    defer category.deinit(allocator);
+    var schema = try Schema.init(allocator, &.{category});
+    defer schema.deinit(allocator);
+
+    var data = try buildFileDictionaryBatch(allocator);
+    defer data.deinit();
+
+    var writer = try FileWriter.init(allocator, schema);
+    defer writer.deinit();
+    try writer.writeBatch(data);
+    const bytes = try writer.finish();
+    defer allocator.free(bytes);
+
+    var reader = try FileReader.init(allocator, bytes);
+    defer reader.deinit();
+    try testing.expect(schema.equals(reader.schema));
+    try testing.expectEqual(@as(usize, 1), reader.batchCount());
+
+    var back = try reader.readBatch(0);
+    defer back.deinit();
+    try back.validateFull();
+    const cat = back.child(0);
+    try testing.expectEqualSlices(i8, &.{ 1, 0, 2 }, cat.values(i8));
+    try testing.expectEqualStrings("blue", cat.dictionary.?.valueBytes(2));
+}
+
+/// A one-column dictionary batch: indices [1, 0, 2] into ["red", "green",
+/// "blue"], built by hand since no typed dictionary builder exists yet.
+fn buildFileDictionaryBatch(allocator: Allocator) !ArrayData {
+    const Buffer = @import("../buffer.zig").Buffer;
+
+    var offsets = try Buffer.alloc(allocator, 4 * @sizeOf(i32));
+    const off = offsets.items(i32);
+    off[0] = 0;
+    off[1] = 3;
+    off[2] = 8;
+    off[3] = 12;
+    const values = try Buffer.dupe(allocator, "redgreenblue");
+    const dict_buffers = try allocator.alloc(?Buffer, 3);
+    dict_buffers[0] = null;
+    dict_buffers[1] = offsets;
+    dict_buffers[2] = values;
+    const dict_values = try ArrayData.init(allocator, .utf8, 3, 0, dict_buffers, try allocator.alloc(ArrayData, 0));
+
+    var indices = try Buffer.alloc(allocator, 3);
+    indices.items(i8)[0] = 1;
+    indices.items(i8)[1] = 0;
+    indices.items(i8)[2] = 2;
+    const buffers = try allocator.alloc(?Buffer, 2);
+    buffers[0] = null;
+    buffers[1] = indices;
+    const dict_type = try DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    const column = try ArrayData.initDictionary(allocator, dict_type, 3, 0, buffers, dict_values);
+
+    const root_buffers = try allocator.alloc(?Buffer, 1);
+    root_buffers[0] = null;
+    const children = try allocator.alloc(ArrayData, 1);
+    children[0] = column;
+    var inner_dict_type = try DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    defer inner_dict_type.deinit(allocator);
+    const root_type = try DataType.initStruct(allocator, &.{inner_dict_type});
+    return ArrayData.init(allocator, root_type, 3, 0, root_buffers, children);
 }
 
 test "file serialization leaks nothing on allocation failure" {

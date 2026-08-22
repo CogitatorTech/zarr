@@ -211,6 +211,26 @@ pub const ArrayData = struct {
         };
     }
 
+    /// Deep value equality: same type, length, null count, buffer bytes,
+    /// children, and dictionary. Used by the IPC writers to check that later
+    /// batches reuse an already-emitted dictionary unchanged.
+    pub fn dataEquals(self: Self, other: Self) bool {
+        if (!self.data_type.equals(other.data_type)) return false;
+        if (self.length != other.length or self.null_count != other.null_count) return false;
+        if (self.buffers.len != other.buffers.len) return false;
+        for (self.buffers, other.buffers) |a, b| {
+            if ((a == null) != (b == null)) return false;
+            if (a) |buf_a| if (!std.mem.eql(u8, buf_a.data, b.?.data)) return false;
+        }
+        if (self.children.len != other.children.len) return false;
+        for (self.children, other.children) |a, b| {
+            if (!a.dataEquals(b)) return false;
+        }
+        if ((self.dictionary == null) != (other.dictionary == null)) return false;
+        if (self.dictionary) |dict| if (!dict.dataEquals(other.dictionary.?.*)) return false;
+        return true;
+    }
+
     /// The validity buffer, or null when the array carries none.
     pub fn validity(self: Self) ?Buffer {
         if (self.buffers.len == 0) return null;
@@ -951,4 +971,18 @@ test "array data deep clone is independent" {
     try copy.validateFull();
     try testing.expectEqual(@as(usize, 2), copy.length);
     try testing.expectEqualStrings("yy", copy.dictionary.?.valueBytes(1));
+}
+
+test "dataEquals compares buffers, children, and dictionaries" {
+    const allocator = testing.allocator;
+    var a = try testDictionaryValues(allocator);
+    defer a.deinit();
+    var b = try testDictionaryValues(allocator);
+    defer b.deinit();
+    try testing.expect(a.dataEquals(b));
+
+    var c = try testDictionaryValues(allocator);
+    defer c.deinit();
+    @constCast(c.buffers[2].?.data)[0] = 'X';
+    try testing.expect(!a.dataEquals(c));
 }

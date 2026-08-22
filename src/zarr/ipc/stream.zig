@@ -10,8 +10,9 @@
 //! `StreamWriter` builds a stream in memory, and `StreamReader` walks one,
 //! returning each batch's columns as `ArrayData`. The reader collects
 //! dictionary batches into a map and attaches the values to the
-//! dictionary-encoded columns that reference them; dictionary deltas and
-//! writing dictionary-encoded schemas are not implemented yet.
+//! dictionary-encoded columns that reference them. The writer emits each
+//! dictionary once, before the first batch that uses it; dictionary deltas
+//! are not implemented yet.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -20,6 +21,7 @@ const Builder = flatbuffers.Builder;
 const message = @import("message.zig");
 const ipc_schema = @import("schema.zig");
 const batch = @import("batch.zig");
+const Buffer = @import("../buffer.zig").Buffer;
 const Schema = @import("../schema.zig").Schema;
 const Field = @import("../schema.zig").Field;
 const DataType = @import("../datatype.zig").DataType;
@@ -53,6 +55,11 @@ const metadata_version_v5: i16 = 4;
 /// The 8-byte end-of-stream marker: the continuation marker followed by a
 /// zero metadata length.
 pub const end_of_stream = [8]u8{ 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0 };
+
+/// The location of one encapsulated message inside a buffer being written:
+/// its offset, its prefix-plus-metadata length, and its body length. The
+/// file writer records these as footer blocks.
+pub const MessageBlock = struct { offset: i64, metadata_length: i32, body_length: i64 };
 
 /// Encodes `schema` as one encapsulated schema message. The caller owns the
 /// returned bytes.
@@ -93,14 +100,18 @@ fn writeMessage(b: *Builder, header_tag: u8, header: flatbuffers.Offset, body_le
 pub const StreamWriter = struct {
     allocator: Allocator,
     buf: std.ArrayListUnmanaged(u8),
+    /// Dictionary values already written, by id; owned by this writer and
+    /// kept to check that later batches reuse them unchanged.
+    emitted: batch.Dictionaries,
 
-    /// Starts a stream by writing the schema message. Writing
-    /// dictionary-encoded schemas is not implemented yet and is refused.
-    /// Release with `deinit`.
-    pub fn init(allocator: Allocator, schema: Schema) (Allocator.Error || error{UnsupportedType})!StreamWriter {
-        if (schemaUsesDictionaries(schema)) return error.UnsupportedType;
-        var self = StreamWriter{ .allocator = allocator, .buf = .empty };
-        errdefer self.buf.deinit(allocator);
+    /// Starts a stream by writing the schema message. Release with `deinit`.
+    pub fn init(allocator: Allocator, schema: Schema) Allocator.Error!StreamWriter {
+        var self = StreamWriter{
+            .allocator = allocator,
+            .buf = .empty,
+            .emitted = batch.Dictionaries.init(allocator),
+        };
+        errdefer self.deinit();
         const msg = try encodeSchemaMessage(allocator, schema);
         defer allocator.free(msg);
         try self.buf.appendSlice(allocator, msg);
@@ -109,13 +120,23 @@ pub const StreamWriter = struct {
 
     pub fn deinit(self: *StreamWriter) void {
         self.buf.deinit(self.allocator);
+        var it = self.emitted.valueIterator();
+        while (it.next()) |values| values.deinit();
+        self.emitted.deinit();
         self.* = undefined;
     }
 
-    /// Appends one record batch message. `data` is the struct-typed columns
-    /// of a batch, as produced by `RecordBatch.toData`, and must match the
-    /// schema the stream was started with; the caller keeps ownership.
-    pub fn writeBatch(self: *StreamWriter, data: ArrayData) Allocator.Error!void {
+    /// Appends one record batch message, preceded by a dictionary batch
+    /// message for every dictionary the batch uses that has not been emitted
+    /// yet. A later batch must reuse an emitted dictionary unchanged, since
+    /// deltas are not implemented; a changed dictionary returns
+    /// `error.UnsupportedType`. `data` is the struct-typed columns of a
+    /// batch and must match the schema the stream was started with; the
+    /// caller keeps ownership.
+    pub fn writeBatch(self: *StreamWriter, data: ArrayData) (Allocator.Error || error{UnsupportedType})!void {
+        for (data.children) |column| {
+            try emitDictionaries(self.allocator, &self.buf, &self.emitted, column);
+        }
         const msg = try encodeBatchMessage(self.allocator, data);
         defer self.allocator.free(msg);
         try self.buf.appendSlice(self.allocator, msg);
@@ -216,25 +237,90 @@ pub const StreamReader = struct {
     }
 };
 
-/// Whether any field in `schema` uses dictionary encoding, at any nesting
-/// depth. The writers refuse such schemas until dictionary writing lands.
-pub fn schemaUsesDictionaries(schema: Schema) bool {
-    for (schema.fields) |f| {
-        if (typeUsesDictionaries(f.data_type)) return true;
-    }
-    return false;
+/// Walks an array, appending a dictionary batch message for every
+/// dictionary node whose id has not been emitted, inner dictionaries first so
+/// a reader can resolve nested encodings in order. An id seen again must
+/// carry the same values; deltas are not implemented.
+fn emitDictionaries(
+    allocator: Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    emitted: *batch.Dictionaries,
+    data: ArrayData,
+) (Allocator.Error || error{UnsupportedType})!void {
+    return emitDictionariesRecorded(allocator, buf, emitted, data, null);
 }
 
-fn typeUsesDictionaries(data_type: DataType) bool {
-    return switch (data_type) {
-        .dictionary => true,
-        .list => |child| typeUsesDictionaries(child.data_type),
-        .fixed_size_list => |fsl| typeUsesDictionaries(fsl.child.data_type),
-        .@"struct" => |fields| for (fields) |f| {
-            if (typeUsesDictionaries(f.data_type)) break true;
-        } else false,
-        else => false,
+/// Like `emitDictionaries`, but records each emitted message's location into
+/// `blocks`; the file writer turns those into footer dictionary blocks.
+pub fn emitDictionariesRecorded(
+    allocator: Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    emitted: *batch.Dictionaries,
+    data: ArrayData,
+    blocks: ?*std.ArrayListUnmanaged(MessageBlock),
+) (Allocator.Error || error{UnsupportedType})!void {
+    if (data.data_type == .dictionary) {
+        const values = data.dictionary.?;
+        // The values may contain dictionary-encoded children of their own.
+        try emitDictionariesRecorded(allocator, buf, emitted, values.*, blocks);
+
+        const id = data.data_type.dictionary.id;
+        if (emitted.getPtr(id)) |seen| {
+            if (!seen.dataEquals(values.*)) return error.UnsupportedType;
+            return;
+        }
+        const encoded = try encodeDictionaryMessage(allocator, id, values.*);
+        defer allocator.free(encoded.bytes);
+        if (blocks) |list| {
+            try list.append(allocator, .{
+                .offset = @intCast(buf.items.len),
+                .metadata_length = @intCast(encoded.bytes.len - encoded.body_length),
+                .body_length = @intCast(encoded.body_length),
+            });
+        }
+        try buf.appendSlice(allocator, encoded.bytes);
+        var kept = try values.clone(allocator);
+        errdefer kept.deinit();
+        try emitted.put(id, kept);
+        return;
+    }
+    for (data.children) |child| {
+        try emitDictionariesRecorded(allocator, buf, emitted, child, blocks);
+    }
+}
+
+const EncodedMessage = struct { bytes: []u8, body_length: u64 };
+
+/// Encodes one dictionary batch message: the values as a single-column
+/// record batch inside a `DictionaryBatch` header. The values are borrowed.
+fn encodeDictionaryMessage(allocator: Allocator, id: i64, values: ArrayData) Allocator.Error!EncodedMessage {
+    var children = [1]ArrayData{values};
+    var root_buffers = [1]?Buffer{null};
+    // A borrowed root over the values; writeRecordBatch and encodeBody only
+    // read it, and its empty struct type is never released.
+    const root = ArrayData{
+        .allocator = allocator,
+        .data_type = .{ .@"struct" = &.{} },
+        .length = values.length,
+        .null_count = 0,
+        .buffers = root_buffers[0..],
+        .children = children[0..],
     };
+
+    var b = Builder.init(allocator);
+    defer b.deinit();
+    const batch_off = try batch.writeRecordBatch(&b, root);
+    const body_length = batch.bodyLength(root);
+    // DictionaryBatch slots (Message.fbs): 0 id, 1 data, 2 isDelta.
+    b.startTable();
+    try b.addScalar(i64, 0, id, 0);
+    try b.addOffset(1, batch_off);
+    const dict_off = try b.endTable();
+    const metadata = try b.finish(try writeMessage(&b, header_dictionary_batch, dict_off, @intCast(body_length)));
+
+    const body = try batch.encodeBody(allocator, root);
+    defer allocator.free(body);
+    return .{ .bytes = try message.encode(allocator, metadata, body), .body_length = body_length };
 }
 
 /// The value type of the dictionary with the given id, found anywhere in the
@@ -659,6 +745,122 @@ test "reader decodes a dictionary-encoded stream written by pyarrow" {
     try testing.expectEqualSlices(i32, &.{ 5, 6 }, second.child(1).values(i32));
 
     try testing.expectEqual(@as(?ArrayData, null), try reader.next());
+}
+
+/// A hand-built dictionary column: indices into ["red", "green", "blue"].
+fn buildDictionaryColumn(allocator: Allocator, indices_bytes: []const i8, validity_byte: ?u8) !ArrayData {
+    var offsets = try Buffer.alloc(allocator, 4 * @sizeOf(i32));
+    const off = offsets.items(i32);
+    off[0] = 0;
+    off[1] = 3;
+    off[2] = 8;
+    off[3] = 12;
+    const values = try Buffer.dupe(allocator, "redgreenblue");
+    const dict_buffers = try allocator.alloc(?Buffer, 3);
+    dict_buffers[0] = null;
+    dict_buffers[1] = offsets;
+    dict_buffers[2] = values;
+    const dict_values = try ArrayData.init(allocator, .utf8, 3, 0, dict_buffers, try allocator.alloc(ArrayData, 0));
+
+    var indices = try Buffer.alloc(allocator, indices_bytes.len);
+    @memcpy(indices.items(i8)[0..indices_bytes.len], indices_bytes);
+    const buffers = try allocator.alloc(?Buffer, 2);
+    if (validity_byte) |byte| {
+        var validity = try Buffer.allocZeroed(allocator, 1);
+        validity.data[0] = byte;
+        buffers[0] = validity;
+    } else {
+        buffers[0] = null;
+    }
+    buffers[1] = indices;
+    var null_count: usize = 0;
+    if (validity_byte) |byte| null_count = indices_bytes.len - @popCount(byte & ((@as(u8, 1) << @intCast(indices_bytes.len)) - 1));
+
+    const dict_type = try zarr_datatype.DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    return ArrayData.initDictionary(allocator, dict_type, indices_bytes.len, null_count, buffers, dict_values);
+}
+
+const zarr_datatype = @import("../datatype.zig");
+
+fn buildDictionaryBatchData(allocator: Allocator, indices_bytes: []const i8, validity_byte: ?u8) !ArrayData {
+    const column = try buildDictionaryColumn(allocator, indices_bytes, validity_byte);
+    const root_buffers = try allocator.alloc(?Buffer, 1);
+    root_buffers[0] = null;
+    const children = try allocator.alloc(ArrayData, 1);
+    children[0] = column;
+    var struct_type = try DataType.initStruct(allocator, &.{.utf8});
+    // The column is dictionary-encoded; the root type must match it.
+    struct_type.deinit(allocator);
+    var dict_type = try zarr_datatype.DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    defer dict_type.deinit(allocator);
+    const root_type = try DataType.initStruct(allocator, &.{dict_type});
+    return ArrayData.init(allocator, root_type, indices_bytes.len, 0, root_buffers, children);
+}
+
+test "dictionary-encoded batches round-trip through the stream" {
+    const allocator = testing.allocator;
+
+    var dict_type = try zarr_datatype.DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    defer dict_type.deinit(allocator);
+    var category = try Field.init(allocator, "category", dict_type, true);
+    defer category.deinit(allocator);
+    var schema = try Schema.init(allocator, &.{category});
+    defer schema.deinit(allocator);
+
+    var batch1 = try buildDictionaryBatchData(allocator, &.{ 0, 1, 2, 0 }, 0b1011);
+    defer batch1.deinit();
+    var batch2 = try buildDictionaryBatchData(allocator, &.{ 2, 2 }, null);
+    defer batch2.deinit();
+
+    var writer = try StreamWriter.init(allocator, schema);
+    defer writer.deinit();
+    try writer.writeBatch(batch1);
+    try writer.writeBatch(batch2); // the same dictionary: emitted only once
+    const bytes = try writer.finish();
+    defer allocator.free(bytes);
+
+    var reader = try StreamReader.init(allocator, bytes);
+    defer reader.deinit();
+    try testing.expect(schema.equals(reader.schema));
+
+    var first = (try reader.next()) orelse return error.MissingBatch;
+    defer first.deinit();
+    try first.validateFull();
+    const cat = first.child(0);
+    try testing.expectEqualSlices(i8, &.{ 0, 1, 2, 0 }, cat.values(i8));
+    try testing.expect(!cat.isValid(2));
+    try testing.expectEqualStrings("red", cat.dictionary.?.valueBytes(0));
+    try testing.expectEqualStrings("blue", cat.dictionary.?.valueBytes(2));
+
+    var second = (try reader.next()) orelse return error.MissingBatch;
+    defer second.deinit();
+    try testing.expectEqualSlices(i8, &.{ 2, 2 }, second.child(0).values(i8));
+    try testing.expectEqualStrings("green", second.child(0).dictionary.?.valueBytes(1));
+
+    try testing.expectEqual(@as(?ArrayData, null), try reader.next());
+}
+
+test "a changed dictionary in a later batch is refused" {
+    const allocator = testing.allocator;
+
+    var dict_type = try zarr_datatype.DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    defer dict_type.deinit(allocator);
+    var category = try Field.init(allocator, "category", dict_type, true);
+    defer category.deinit(allocator);
+    var schema = try Schema.init(allocator, &.{category});
+    defer schema.deinit(allocator);
+
+    var batch1 = try buildDictionaryBatchData(allocator, &.{0}, null);
+    defer batch1.deinit();
+    var batch2 = try buildDictionaryBatchData(allocator, &.{0}, null);
+    defer batch2.deinit();
+    // Change one dictionary byte: "red" becomes "rad".
+    @constCast(batch2.child(0).dictionary.?.buffers[2].?.data)[1] = 'a';
+
+    var writer = try StreamWriter.init(allocator, schema);
+    defer writer.deinit();
+    try writer.writeBatch(batch1);
+    try testing.expectError(error.UnsupportedType, writer.writeBatch(batch2));
 }
 
 test "stream serialization leaks nothing on allocation failure" {
