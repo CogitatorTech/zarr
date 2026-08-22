@@ -16,6 +16,7 @@ pub const array_data = @import("zarr/array_data.zig");
 pub const null_array = @import("zarr/null_array.zig");
 pub const c_data = @import("zarr/c_data.zig");
 pub const ipc_message = @import("zarr/ipc/message.zig");
+pub const ipc_schema = @import("zarr/ipc/schema.zig");
 pub const flatbuffers = @import("zarr/ipc/flatbuffers.zig");
 
 pub const Buffer = buffer.Buffer;
