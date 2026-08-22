@@ -76,6 +76,8 @@ def main():
     lib.zarr_export_sample_batch.restype = ctypes.c_int
     lib.zarr_verify_sample_batch.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
     lib.zarr_verify_sample_batch.restype = ctypes.c_int
+    lib.zarr_verify_sample_batch_slice.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
+    lib.zarr_verify_sample_batch_slice.restype = ctypes.c_int
 
     # Compare by value, not by full schema equality: field names on nested
     # children and nullability metadata are not what this test asserts.
@@ -108,6 +110,16 @@ def main():
     rc = lib.zarr_verify_sample_batch(addr(c_schema2), addr(c_array2))
     assert rc == 0, f"zarr_verify_sample_batch returned {rc}"
     print("PASS: pyarrow export -> Zarr import")
+
+    # Direction 3: pyarrow exports a slice, which arrives with a non-zero
+    # offset; Zarr must honor it on import.
+    sliced = build_reference().slice(1, 2)
+    c_schema3 = ffi.new("struct ArrowSchema*")
+    c_array3 = ffi.new("struct ArrowArray*")
+    sliced._export_to_c(addr(c_array3), addr(c_schema3))
+    rc = lib.zarr_verify_sample_batch_slice(addr(c_schema3), addr(c_array3))
+    assert rc == 0, f"zarr_verify_sample_batch_slice returned {rc}"
+    print("PASS: pyarrow sliced export -> Zarr import")
 
     print(f"OK: C Data Interface round-trip verified against pyarrow {pa.__version__}")
     return 0

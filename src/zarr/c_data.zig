@@ -484,20 +484,42 @@ pub fn importSchemaFields(allocator: Allocator, c_schema: *const ArrowSchema) Im
 }
 
 /// Error set for importing a foreign array.
-pub const ImportArrayError = Allocator.Error || error{ InvalidFormat, UnsupportedOffset };
+pub const ImportArrayError = Allocator.Error || error{InvalidFormat};
 
 /// Read a foreign `ArrowArray` of logical type `data_type` into an owned Zarr
-/// `ArrayData`, copying every buffer. The C struct carries no buffer lengths,
-/// so each buffer's size is computed from `data_type`, the length, and, for
-/// variable-length types, the final offset. This does not consume `array`; the
-/// caller keeps ownership and remains responsible for its release callback. A
-/// non-zero `offset` is not representable in `ArrayData` and returns
-/// `error.UnsupportedOffset`. The returned data is owned by the caller.
+/// `ArrayData`, copying every buffer. A non-zero `offset` is materialized
+/// away during the copy: bitmaps are re-packed from the offset bit, values
+/// are copied from the offset element, variable-length offsets are rebased to
+/// start at zero, and list children are trimmed to the referenced window, so
+/// the result always starts at element zero. The null count is recomputed
+/// from the copied validity bitmap, which also handles the interface's -1 for
+/// unknown. The copied arrays are validated in full before they are returned.
+/// This does not consume `array`; the caller keeps ownership and remains
+/// responsible for its release callback. The returned data is owned by the
+/// caller.
 pub fn importArray(allocator: Allocator, data_type: DataType, array: *const ArrowArray) ImportArrayError!ArrayData {
-    if (array.offset != 0) return error.UnsupportedOffset;
-    const length: usize = @intCast(array.length);
-    const null_count: usize = @intCast(array.null_count);
-    if (null_count > length) return error.InvalidFormat;
+    if (array.length < 0) return error.InvalidFormat;
+    var result = try importArraySlice(allocator, data_type, array, 0, @intCast(array.length));
+    result.validateFull() catch {
+        result.deinit();
+        return error.InvalidFormat;
+    };
+    return result;
+}
+
+/// Imports the logical window `[extra_offset, extra_offset + length)` of a
+/// foreign array. `extra_offset` carries a parent struct's slice into its
+/// children, on top of the array's own `offset`.
+fn importArraySlice(
+    allocator: Allocator,
+    data_type: DataType,
+    array: *const ArrowArray,
+    extra_offset: usize,
+    length: usize,
+) ImportArrayError!ArrayData {
+    if (array.length < 0 or array.offset < 0) return error.InvalidFormat;
+    if (extra_offset + length > @as(usize, @intCast(array.length))) return error.InvalidFormat;
+    const total = extra_offset + @as(usize, @intCast(array.offset));
 
     const n_buffers = ArrayData.bufferCount(data_type);
     const n_children = ArrayData.childCount(data_type);
@@ -505,40 +527,136 @@ pub fn importArray(allocator: Allocator, data_type: DataType, array: *const Arro
     if (@as(usize, @intCast(array.n_children)) != n_children) return error.InvalidFormat;
 
     const buffers = try allocator.alloc(?Buffer, n_buffers);
-    var built_buffers: usize = 0;
+    for (buffers) |*slot| slot.* = null;
     errdefer {
-        for (buffers[0..built_buffers]) |*b| if (b.*) |*buf| buf.deinit();
+        for (buffers) |*b| if (b.*) |*buf| buf.deinit();
         allocator.free(buffers);
     }
-    for (0..n_buffers) |k| {
-        const src: ?*const anyopaque = if (array.buffers) |bp| bp[k] else null;
-        if (src) |ptr| {
-            const size = bufferByteLen(data_type, k, length, array);
-            const bytes = @as([*]const u8, @ptrCast(ptr))[0..size];
-            buffers[k] = try Buffer.dupe(allocator, bytes);
-        } else {
-            buffers[k] = null; // e.g. an absent validity buffer
-        }
-        built_buffers += 1;
-    }
-
     const children = try allocator.alloc(ArrayData, n_children);
     var built_children: usize = 0;
     errdefer {
         for (children[0..built_children]) |*c| c.deinit();
         allocator.free(children);
     }
-    for (0..n_children) |i| {
-        children[i] = try importArray(allocator, childTypeAt(data_type, i), array.children.?[i]);
-        built_children += 1;
+
+    // Validity, re-packed from the offset bit; an absent buffer stays absent.
+    if (n_buffers > 0) {
+        if (bufferAt(array, 0)) |src| buffers[0] = try copyBitWindow(allocator, src, total, length);
     }
+
+    switch (data_type) {
+        .null => {},
+        .boolean => {
+            const src = bufferAt(array, 1) orelse return error.InvalidFormat;
+            buffers[1] = try copyBitWindow(allocator, src, total, length);
+        },
+        .binary, .utf8 => _ = try importOffsetWindow(i32, allocator, array, total, length, buffers, true),
+        .large_binary, .large_utf8 => _ = try importOffsetWindow(i64, allocator, array, total, length, buffers, true),
+        .list => |child_field| {
+            const window = try importOffsetWindow(i32, allocator, array, total, length, buffers, false);
+            children[0] = try importArraySlice(allocator, child_field.data_type, array.children.?[0], window.first, window.len);
+            built_children = 1;
+        },
+        .@"struct" => |fields| {
+            // A struct's offset applies to its children as well: logical
+            // element i of the struct is element total + i of each child.
+            for (fields, 0..) |field, i| {
+                children[i] = try importArraySlice(allocator, field.data_type, array.children.?[i], total, length);
+                built_children += 1;
+            }
+        },
+        else => {
+            const width = data_type.bitWidth().? / 8;
+            const src = bufferAt(array, 1) orelse return error.InvalidFormat;
+            buffers[1] = try Buffer.dupe(allocator, src[total * width ..][0 .. length * width]);
+        },
+    }
+
+    // The foreign null count is not trusted: it may be -1 for unknown, or
+    // describe the whole array rather than this window.
+    const null_count: usize = if (data_type == .null)
+        length
+    else if (buffers.len > 0 and buffers[0] != null)
+        length - countSetBits(buffers[0].?.data, length)
+    else
+        0;
 
     var dt = try data_type.clone(allocator);
     errdefer dt.deinit(allocator);
 
-    // Counts, null count, and child types were all validated above, so the
-    // layout is well formed and `init` cannot fail here.
+    // Counts and child types are correct by construction, so `init` cannot
+    // fail; `importArray` runs the deep validation afterwards.
     return ArrayData.init(allocator, dt, length, null_count, buffers, children) catch unreachable;
+}
+
+/// Buffer `k` of a foreign array as a byte pointer, or null when absent.
+fn bufferAt(array: *const ArrowArray, k: usize) ?[*]const u8 {
+    const bp = array.buffers orelse return null;
+    const ptr = bp[k] orelse return null;
+    return @ptrCast(ptr);
+}
+
+/// Copies `length` bits starting at `bit_offset` into a fresh byte-aligned
+/// bitmap buffer.
+fn copyBitWindow(allocator: Allocator, src: [*]const u8, bit_offset: usize, length: usize) Allocator.Error!Buffer {
+    var out = try Buffer.allocZeroed(allocator, (length + 7) / 8);
+    for (0..length) |i| {
+        const bit = bit_offset + i;
+        if (src[bit / 8] & (@as(u8, 1) << @intCast(bit % 8)) != 0) {
+            out.data[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+        }
+    }
+    return out;
+}
+
+/// Set bits among the first `length` bits of `bitmap`.
+fn countSetBits(bitmap: []const u8, length: usize) usize {
+    var count: usize = 0;
+    for (bitmap[0 .. length / 8]) |byte| count += @popCount(byte);
+    const rem: u3 = @intCast(length % 8);
+    if (rem != 0) {
+        const mask = (@as(u8, 1) << rem) - 1;
+        count += @popCount(bitmap[length / 8] & mask);
+    }
+    return count;
+}
+
+const OffsetWindow = struct { first: usize, len: usize };
+
+/// Copies the offsets of a variable-length or list layout for the window at
+/// `total`, rebased to start at zero, into buffer slot 1. When `copy_values`
+/// is set, also copies the referenced byte range of the values buffer into
+/// slot 2. Returns the referenced window of the child space.
+fn importOffsetWindow(
+    comptime OffsetInt: type,
+    allocator: Allocator,
+    array: *const ArrowArray,
+    total: usize,
+    length: usize,
+    buffers: []?Buffer,
+    copy_values: bool,
+) ImportArrayError!OffsetWindow {
+    const raw = bufferAt(array, 1) orelse return error.InvalidFormat;
+    const src: [*]const OffsetInt = @ptrCast(@alignCast(raw));
+    const first = src[total];
+    const last = src[total + length];
+    if (first < 0 or last < first) return error.InvalidFormat;
+
+    // Stored before filling, so the caller's cleanup owns it on any error.
+    buffers[1] = try Buffer.alloc(allocator, (length + 1) * @sizeOf(OffsetInt));
+    const out = buffers[1].?.items(OffsetInt);
+    for (0..length + 1) |i| {
+        const rebased = src[total + i] - first;
+        if (rebased < 0) return error.InvalidFormat;
+        out[i] = rebased;
+    }
+
+    const window = OffsetWindow{ .first = @intCast(first), .len = @intCast(last - first) };
+    if (copy_values) {
+        const values = bufferAt(array, 2) orelse return error.InvalidFormat;
+        buffers[2] = try Buffer.dupe(allocator, values[window.first..][0..window.len]);
+    }
+    return window;
 }
 
 /// Read a foreign record batch, given as a paired schema and array, into an
@@ -590,15 +708,6 @@ fn bufferByteLen(data_type: DataType, k: usize, length: usize, array: *const Arr
 fn lastOffset(comptime OffsetInt: type, array: *const ArrowArray, length: usize) usize {
     const offsets: [*]const OffsetInt = @ptrCast(@alignCast(array.buffers.?[1].?));
     return @intCast(offsets[length]);
-}
-
-/// The logical type of child `i` in the canonical layout of a nested type.
-fn childTypeAt(data_type: DataType, i: usize) DataType {
-    return switch (data_type) {
-        .list => data_type.list.data_type,
-        .@"struct" => data_type.@"struct"[i].data_type,
-        else => unreachable,
-    };
 }
 
 const testing = std.testing;
@@ -864,21 +973,176 @@ test "import array round-trips a struct with a validity buffer and children" {
     try testing.expectEqualStrings("a", rebuilt.field(1).get(0).?);
 }
 
-test "import array rejects a non-zero offset" {
+/// Exports `data` and frees it, leaving the caller with only the C struct.
+fn exportOwned(allocator: Allocator, data: ArrayData, out: *ArrowArray) !void {
+    try exportArray(allocator, data, out);
+}
+
+test "import array honors a non-zero offset" {
     const allocator = testing.allocator;
     var builder = PrimitiveArray(i32).Builder.init(allocator);
     defer builder.deinit();
     try builder.append(1);
+    try builder.append(2);
+    try builder.append(3);
     var arr = try builder.finish();
     const data = try arr.toData(allocator);
     arr.deinit();
 
     var carray: ArrowArray = undefined;
-    try exportArray(allocator, data, &carray);
+    try exportOwned(allocator, data, &carray);
+    defer carray.release.?(&carray);
+
+    // A foreign producer may hand over a slice: logical [2, 3].
+    carray.offset = 1;
+    carray.length = 2;
+    var imported = try importArray(allocator, .int32, &carray);
+    defer imported.deinit();
+
+    try testing.expectEqual(@as(usize, 2), imported.length);
+    try testing.expectEqualSlices(i32, &.{ 2, 3 }, imported.values(i32));
+}
+
+test "import array recomputes an unknown null count" {
+    const allocator = testing.allocator;
+    var builder = PrimitiveArray(i32).Builder.init(allocator);
+    defer builder.deinit();
+    try builder.append(1);
+    try builder.appendNull();
+    try builder.append(3);
+    var arr = try builder.finish();
+    const data = try arr.toData(allocator);
+    arr.deinit();
+
+    var carray: ArrowArray = undefined;
+    try exportOwned(allocator, data, &carray);
+    defer carray.release.?(&carray);
+
+    carray.null_count = -1; // unknown, per the C Data Interface
+    var imported = try importArray(allocator, .int32, &carray);
+    defer imported.deinit();
+
+    try testing.expectEqual(@as(usize, 1), imported.null_count);
+    try testing.expect(!imported.isValid(1));
+}
+
+test "import array slices a utf8 array and rebases its offsets" {
+    const allocator = testing.allocator;
+    var builder = Utf8Array.Builder.init(allocator);
+    defer builder.deinit();
+    try builder.append("a");
+    try builder.append("bb");
+    try builder.append("ccc");
+    var arr = try builder.finish();
+    const data = try arr.toData(allocator);
+    arr.deinit();
+
+    var carray: ArrowArray = undefined;
+    try exportOwned(allocator, data, &carray);
     defer carray.release.?(&carray);
 
     carray.offset = 1;
-    try testing.expectError(error.UnsupportedOffset, importArray(allocator, .int32, &carray));
+    carray.length = 2;
+    var imported = try importArray(allocator, .utf8, &carray);
+    defer imported.deinit();
+
+    try testing.expectEqualSlices(i32, &.{ 0, 2, 5 }, imported.offsets(i32));
+    try testing.expectEqualStrings("bb", imported.valueBytes(0));
+    try testing.expectEqualStrings("ccc", imported.valueBytes(1));
+}
+
+test "import array slices a boolean array across a byte boundary" {
+    const allocator = testing.allocator;
+    const source = [_]bool{ true, false, true, false, true, true, false, false, true, true };
+    const BooleanArray = @import("boolean_array.zig").BooleanArray;
+    var builder = BooleanArray.Builder.init(allocator);
+    defer builder.deinit();
+    for (source) |v| try builder.append(v);
+    var arr = try builder.finish();
+    const data = try arr.toData(allocator);
+    arr.deinit();
+
+    var carray: ArrowArray = undefined;
+    try exportOwned(allocator, data, &carray);
+    defer carray.release.?(&carray);
+
+    carray.offset = 3;
+    carray.length = 6;
+    var imported = try importArray(allocator, .boolean, &carray);
+    defer imported.deinit();
+
+    const bits = imported.buffers[1].?.data;
+    for (source[3..9], 0..) |expected, i| {
+        const got = bits[i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0;
+        try testing.expectEqual(expected, got);
+    }
+}
+
+test "import array slices a struct array through its children" {
+    const allocator = testing.allocator;
+    const Person = StructArray(&[_]type{ PrimitiveArray(i32), Utf8Array });
+    var b = Person.Builder.init(allocator);
+    defer b.deinit();
+    try b.children[0].append(1);
+    try b.children[1].append("a");
+    try b.append();
+    try b.appendNull();
+    try b.children[0].append(3);
+    try b.children[1].append("ccc");
+    try b.append();
+    var s = try b.finish();
+    const data = try s.toData(allocator);
+    s.deinit();
+
+    var carray: ArrowArray = undefined;
+    try exportOwned(allocator, data, &carray);
+    defer carray.release.?(&carray);
+
+    carray.offset = 1;
+    carray.length = 2;
+    var struct_type = try DataType.initStruct(allocator, &.{ .int32, .utf8 });
+    defer struct_type.deinit(allocator);
+    var imported = try importArray(allocator, struct_type, &carray);
+    defer imported.deinit();
+
+    try testing.expectEqual(@as(usize, 2), imported.length);
+    try testing.expect(!imported.isValid(0));
+    try testing.expect(imported.isValid(1));
+    try testing.expectEqual(@as(i32, 3), imported.child(0).values(i32)[1]);
+    try testing.expectEqualStrings("ccc", imported.child(1).valueBytes(1));
+}
+
+test "import array slices a list array and trims the child" {
+    const allocator = testing.allocator;
+    const Int32List = @import("list_array.zig").ListArray(PrimitiveArray(i32));
+    var b = Int32List.Builder.init(allocator);
+    defer b.deinit();
+    try b.values.append(1);
+    try b.values.append(2);
+    try b.appendList();
+    try b.appendList();
+    try b.values.append(3);
+    try b.values.append(4);
+    try b.values.append(5);
+    try b.appendList();
+    var arr = try b.finish();
+    const data = try arr.toData(allocator);
+    arr.deinit();
+
+    var carray: ArrowArray = undefined;
+    try exportOwned(allocator, data, &carray);
+    defer carray.release.?(&carray);
+
+    carray.offset = 1;
+    carray.length = 2;
+    var list_type = try DataType.initList(allocator, .int32);
+    defer list_type.deinit(allocator);
+    var imported = try importArray(allocator, list_type, &carray);
+    defer imported.deinit();
+
+    try testing.expectEqualSlices(i32, &.{ 0, 0, 3 }, imported.offsets(i32));
+    try testing.expectEqual(@as(usize, 3), imported.child(0).length);
+    try testing.expectEqualSlices(i32, &.{ 3, 4, 5 }, imported.child(0).values(i32));
 }
 
 test "export and import a field carry the name and nullability" {

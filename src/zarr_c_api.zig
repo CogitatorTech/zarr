@@ -188,6 +188,25 @@ fn verifySampleFile(bytes: []const u8) !bool {
     return batchMatchesSample(batch);
 }
 
+/// Import the `ArrowSchema` and `ArrowArray` at the given addresses, release
+/// them, and check the batch equals rows 1 and 2 of the sample, which is what
+/// slicing the sample batch as `[1:3]` produces. Verifies that a producer's
+/// non-zero offset is honored on import. Returns 0 on a match, 1 on a
+/// mismatch, and 2 when the import itself fails.
+export fn zarr_verify_sample_batch_slice(schema_addr: usize, array_addr: usize) c_int {
+    const in_schema: *ArrowSchema = @ptrFromInt(schema_addr);
+    const in_array: *ArrowArray = @ptrFromInt(array_addr);
+
+    var batch = zarr.c_data.importRecordBatch(SampleBatch, allocator, in_schema, in_array) catch {
+        releaseBoth(in_schema, in_array);
+        return 2;
+    };
+    defer batch.deinit();
+    releaseBoth(in_schema, in_array);
+
+    return if (batchMatchesSampleRows(batch, 1, 2)) 0 else 1;
+}
+
 fn releaseBoth(schema: *ArrowSchema, array: *ArrowArray) void {
     if (array.release) |release| release(array);
     if (schema.release) |release| release(schema);
@@ -256,28 +275,34 @@ fn buildBatch(schema: zarr.Schema) !SampleBatch {
 }
 
 fn batchMatchesSample(batch: SampleBatch) bool {
-    if (batch.numRows() != row_count) return false;
+    return batchMatchesSampleRows(batch, 0, row_count);
+}
+
+/// Whether `batch` holds exactly rows `[start, start + count)` of the sample.
+fn batchMatchesSampleRows(batch: SampleBatch, start: usize, count: usize) bool {
+    if (batch.numRows() != count) return false;
     const ids = batch.column(0);
     const flags = batch.column(1);
     const names = batch.column(2);
     const bios = batch.column(3);
     const tags = batch.column(4);
     const points = batch.column(5);
-    for (0..row_count) |i| {
-        if (ids.get(i) != @as(?i32, expected_ids[i])) return false;
-        if (!optBoolEq(flags.get(i), expected_flags[i])) return false;
-        if (!optBytesEq(names.get(i), expected_names[i])) return false;
-        if (!optBytesEq(bios.get(i), expected_bios[i])) return false;
-        if (tags.valueLength(i) != expected_tags[i].len) return false;
-        const base = tags.valueOffset(i);
-        for (expected_tags[i], 0..) |element, j| {
-            if (tags.values.get(base + j) != @as(?i32, element)) return false;
+    for (0..count) |j| {
+        const i = start + j;
+        if (ids.get(j) != @as(?i32, expected_ids[i])) return false;
+        if (!optBoolEq(flags.get(j), expected_flags[i])) return false;
+        if (!optBytesEq(names.get(j), expected_names[i])) return false;
+        if (!optBytesEq(bios.get(j), expected_bios[i])) return false;
+        if (tags.valueLength(j) != expected_tags[i].len) return false;
+        const base = tags.valueOffset(j);
+        for (expected_tags[i], 0..) |element, k| {
+            if (tags.values.get(base + k) != @as(?i32, element)) return false;
         }
         if (expected_points[i]) |p| {
-            if (!points.isValid(i)) return false;
-            if (points.field(0).get(i) != @as(?f64, p.x)) return false;
-            if (!optBytesEq(points.field(1).get(i), p.label)) return false;
-        } else if (points.isValid(i)) {
+            if (!points.isValid(j)) return false;
+            if (points.field(0).get(j) != @as(?f64, p.x)) return false;
+            if (!optBytesEq(points.field(1).get(j), p.label)) return false;
+        } else if (points.isValid(j)) {
             return false;
         }
     }
@@ -308,6 +333,19 @@ test "sample file round-trips through the C API entry points" {
     const written = zarr_encode_sample_file(@intFromPtr(&buf), buf.len);
     try std.testing.expect(written > 0);
     try std.testing.expectEqual(@as(c_int, 0), zarr_verify_sample_file(@intFromPtr(&buf), @intCast(written)));
+}
+
+test "a sliced sample batch verifies through the C API entry points" {
+    // Export fills the structs, then a foreign-style slice is simulated by
+    // moving the root offset, exactly as a producer that hands over rows
+    // [1, 3) would.
+    var schema: ArrowSchema = undefined;
+    var array: ArrowArray = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), zarr_export_sample_batch(@intFromPtr(&schema), @intFromPtr(&array)));
+    array.offset = 1;
+    array.length = 2;
+    array.null_count = -1;
+    try std.testing.expectEqual(@as(c_int, 0), zarr_verify_sample_batch_slice(@intFromPtr(&schema), @intFromPtr(&array)));
 }
 
 test "sample batch round-trips through the C API entry points" {
