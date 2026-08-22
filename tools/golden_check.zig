@@ -101,6 +101,9 @@ fn isUnsupported(err: anyerror) bool {
         error.UnsupportedEndianness,
         error.UnsupportedCompression,
         error.UnsupportedMessage,
+        // Golden files from Arrow 0.14 use the pre-0.15 envelope without the
+        // continuation marker, which Zarr requires.
+        error.MissingContinuation,
         => true,
         else => false,
     };
@@ -270,21 +273,30 @@ fn buildType(allocator: std.mem.Allocator, field_obj: std.json.ObjectMap) BuildE
         return error.UnsupportedGolden;
     }
     if (eq(u8, kind, "timestamp")) {
+        const time_unit = try parseTimeUnit(type_obj);
+        var timezone: ?[]const u8 = null;
         if (type_obj.get("timezone")) |tz| {
-            if (tz == .string and tz.string.len != 0) return error.UnsupportedGolden;
+            if (tz == .string and tz.string.len != 0) timezone = tz.string;
         }
-        const unit = type_obj.get("unit").?.string;
-        const time_unit: zarr.TimeUnit = if (eq(u8, unit, "SECOND"))
-            .second
-        else if (eq(u8, unit, "MILLISECOND"))
-            .millisecond
-        else if (eq(u8, unit, "MICROSECOND"))
-            .microsecond
-        else if (eq(u8, unit, "NANOSECOND"))
-            .nanosecond
-        else
-            return error.UnsupportedGolden;
-        return .{ .timestamp = time_unit };
+        return zarr.DataType.initTimestamp(allocator, time_unit, timezone);
+    }
+    if (eq(u8, kind, "time")) {
+        const time_unit = try parseTimeUnit(type_obj);
+        const bits = type_obj.get("bitWidth").?.integer;
+        return switch (bits) {
+            32 => switch (time_unit) {
+                .second, .millisecond => .{ .time32 = time_unit },
+                else => error.UnsupportedGolden,
+            },
+            64 => switch (time_unit) {
+                .microsecond, .nanosecond => .{ .time64 = time_unit },
+                else => error.UnsupportedGolden,
+            },
+            else => error.UnsupportedGolden,
+        };
+    }
+    if (eq(u8, kind, "duration")) {
+        return .{ .duration = try parseTimeUnit(type_obj) };
     }
 
     const children = field_obj.get("children").?.array.items;
@@ -307,6 +319,16 @@ fn buildType(allocator: std.mem.Allocator, field_obj: std.json.ObjectMap) BuildE
         }
         return zarr.DataType.initStructFields(allocator, fields);
     }
+    return error.UnsupportedGolden;
+}
+
+fn parseTimeUnit(type_obj: std.json.ObjectMap) BuildError!zarr.TimeUnit {
+    const unit = type_obj.get("unit").?.string;
+    const eq = std.mem.eql;
+    if (eq(u8, unit, "SECOND")) return .second;
+    if (eq(u8, unit, "MILLISECOND")) return .millisecond;
+    if (eq(u8, unit, "MICROSECOND")) return .microsecond;
+    if (eq(u8, unit, "NANOSECOND")) return .nanosecond;
     return error.UnsupportedGolden;
 }
 
@@ -363,8 +385,8 @@ fn compareColumn(column_json: std.json.Value, data: zarr.ArrayData, data_type: z
         .uint16 => try compareInts(obj, data, u16, totals),
         .uint32 => try compareInts(obj, data, u32, totals),
         .uint64 => try compareInts(obj, data, u64, totals),
-        .date32 => try compareInts(obj, data, i32, totals),
-        .date64, .timestamp => try compareInts(obj, data, i64, totals),
+        .date32, .time32 => try compareInts(obj, data, i32, totals),
+        .date64, .timestamp, .time64, .duration => try compareInts(obj, data, i64, totals),
         .float16 => try compareFloats(obj, data, f16, totals),
         .float32 => try compareFloats(obj, data, f32, totals),
         .float64 => try compareFloats(obj, data, f64, totals),

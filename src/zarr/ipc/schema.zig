@@ -33,9 +33,9 @@ pub const DecodeError = error{
 
 // Members of the `Type` union in Schema.fbs, in declaration order.
 // FlatBuffers numbers union members from 1; 0 means absent. Members Zarr does
-// not implement (Decimal 7, Time 9, Interval 11, Union 14, FixedSizeBinary 15,
-// FixedSizeList 16, Map 17, Duration 18, and the members past LargeList) have
-// no constant here and decode to `error.UnsupportedType`.
+// not implement (Decimal 7, Interval 11, Union 14, FixedSizeBinary 15,
+// FixedSizeList 16, Map 17, and the members past LargeList) have no constant
+// here and decode to `error.UnsupportedType`.
 const type_null: u8 = 1;
 const type_int: u8 = 2;
 const type_floating_point: u8 = 3;
@@ -43,8 +43,10 @@ const type_binary: u8 = 4;
 const type_utf8: u8 = 5;
 const type_bool: u8 = 6;
 const type_date: u8 = 8;
+const type_time: u8 = 9;
 const type_timestamp: u8 = 10;
 const type_list: u8 = 12;
+const type_duration: u8 = 18;
 const type_struct: u8 = 13;
 const type_large_binary: u8 = 19;
 const type_large_utf8: u8 = 20;
@@ -154,10 +156,11 @@ fn writeType(b: *Builder, data_type: DataType) Allocator.Error!TypeOffset {
         // Date.unit: DAY 0, MILLISECOND 1 (the schema default).
         .date32 => writeScalarType(b, type_date, 0, 1),
         .date64 => writeScalarType(b, type_date, 1, 1),
-        // Timestamp.unit: SECOND 0 through NANOSECOND 3, matching the
-        // declaration order of `TimeUnit`. The timezone is omitted, since
-        // Zarr's timestamp carries none.
-        .timestamp => |unit| writeScalarType(b, type_timestamp, @intFromEnum(unit), 0),
+        .timestamp => |ts| writeTimestampType(b, ts),
+        .time32 => |unit| writeTimeType(b, unit, 32),
+        .time64 => |unit| writeTimeType(b, unit, 64),
+        // Duration.unit: the schema default is MILLISECOND (1).
+        .duration => |unit| writeScalarType(b, type_duration, @intFromEnum(unit), 1),
         .list => writeEmptyType(b, type_list),
         .@"struct" => writeEmptyType(b, type_struct),
     };
@@ -175,6 +178,27 @@ fn writeScalarType(b: *Builder, tag: u8, value: i16, default: i16) Allocator.Err
     b.startTable();
     try b.addScalar(i16, 0, value, default);
     return .{ .tag = tag, .offset = try b.endTable() };
+}
+
+/// Writes a `Timestamp` type table: unit at slot 0 (SECOND 0 through
+/// NANOSECOND 3, the declaration order of `TimeUnit`), and the timezone
+/// string at slot 1 when the timestamp is zoned.
+fn writeTimestampType(b: *Builder, ts: datatype.TimestampType) Allocator.Error!TypeOffset {
+    var tz_off: Offset = 0;
+    if (ts.timezone) |tz| tz_off = try b.createString(tz);
+    b.startTable();
+    try b.addScalar(i16, 0, @intFromEnum(ts.unit), 0);
+    try b.addOffset(1, tz_off);
+    return .{ .tag = type_timestamp, .offset = try b.endTable() };
+}
+
+/// Writes a `Time` type table: unit at slot 0 (default MILLISECOND) and bit
+/// width at slot 1 (default 32).
+fn writeTimeType(b: *Builder, unit: datatype.TimeUnit, bits: i32) Allocator.Error!TypeOffset {
+    b.startTable();
+    try b.addScalar(i16, 0, @intFromEnum(unit), 1);
+    try b.addScalar(i32, 1, bits, 32);
+    return .{ .tag = type_time, .offset = try b.endTable() };
 }
 
 /// Writes an `Int` type table: bit width at slot 0, signedness at slot 1.
@@ -292,14 +316,31 @@ fn readType(allocator: Allocator, field_table: Table, depth: usize) DecodeError!
         },
         type_timestamp => {
             const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
-            // Zarr's timestamp has no timezone, so a zoned timestamp cannot be
-            // represented; dropping the zone would change the data's meaning.
-            if (try t.readString(1)) |tz| {
-                if (tz.len != 0) return error.UnsupportedType;
-            }
             const unit = try t.readScalar(i16, 0, 0);
             if (unit < 0 or unit > 3) return error.UnsupportedType;
-            return .{ .timestamp = @enumFromInt(unit) };
+            var timezone: ?[]const u8 = null;
+            if (try t.readString(1)) |tz| {
+                if (tz.len != 0) timezone = tz;
+            }
+            return DataType.initTimestamp(allocator, @enumFromInt(unit), timezone);
+        },
+        type_time => {
+            const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
+            const unit = try t.readScalar(i16, 0, 1);
+            const bits = try t.readScalar(i32, 1, 32);
+            // The spec pairs 32-bit times with second and millisecond units,
+            // and 64-bit times with microsecond and nanosecond units.
+            if (bits == 32 and unit == 0) return .{ .time32 = .second };
+            if (bits == 32 and unit == 1) return .{ .time32 = .millisecond };
+            if (bits == 64 and unit == 2) return .{ .time64 = .microsecond };
+            if (bits == 64 and unit == 3) return .{ .time64 = .nanosecond };
+            return error.MalformedSchema;
+        },
+        type_duration => {
+            const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
+            const unit = try t.readScalar(i16, 0, 1);
+            if (unit < 0 or unit > 3) return error.UnsupportedType;
+            return .{ .duration = @enumFromInt(unit) };
         },
         type_list => {
             if (try field_table.vectorLen(field_slot_children) != 1) return error.MalformedSchema;
@@ -354,18 +395,18 @@ test "flat schema round-trips through encode and decode" {
 
 test "every flat type round-trips" {
     const flat_types = [_]DataType{
-        .null,                          .boolean,
-        .int8,                          .int16,
-        .int32,                         .int64,
-        .uint8,                         .uint16,
-        .uint32,                        .uint64,
-        .float16,                       .float32,
-        .float64,                       .binary,
-        .utf8,                          .large_binary,
-        .large_utf8,                    .date32,
-        .date64,                        .{ .timestamp = .second },
-        .{ .timestamp = .millisecond }, .{ .timestamp = .microsecond },
-        .{ .timestamp = .nanosecond },
+        .null,                                       .boolean,
+        .int8,                                       .int16,
+        .int32,                                      .int64,
+        .uint8,                                      .uint16,
+        .uint32,                                     .uint64,
+        .float16,                                    .float32,
+        .float64,                                    .binary,
+        .utf8,                                       .large_binary,
+        .large_utf8,                                 .date32,
+        .date64,                                     .{ .timestamp = .{ .unit = .second } },
+        .{ .timestamp = .{ .unit = .millisecond } }, .{ .timestamp = .{ .unit = .microsecond } },
+        .{ .timestamp = .{ .unit = .nanosecond } },
     };
 
     var fields: [flat_types.len]Field = undefined;
@@ -517,7 +558,7 @@ test "decode reads a schema serialized by pyarrow" {
     try testing.expect(schema.field(1).nullable);
 
     try testing.expectEqualStrings("ts", schema.field(2).name);
-    try testing.expect(schema.field(2).data_type.equals(.{ .timestamp = .microsecond }));
+    try testing.expect(schema.field(2).data_type.equals(.{ .timestamp = .{ .unit = .microsecond } }));
 
     try testing.expectEqualStrings("tags", schema.field(3).name);
     try testing.expect(schema.field(3).data_type == .list);
@@ -538,22 +579,55 @@ test "decode rejects a big-endian schema" {
     try testing.expectError(error.UnsupportedEndianness, decode(testing.allocator, buf));
 }
 
-test "decode rejects a timestamp with a timezone" {
+test "temporal types round-trip, including zoned timestamps" {
+    const allocator = testing.allocator;
+
+    var zoned = try DataType.initTimestamp(allocator, .microsecond, "Europe/Paris");
+    defer zoned.deinit(allocator);
+
+    var fields: [6]Field = undefined;
+    var built: usize = 0;
+    defer for (fields[0..built]) |*f| f.deinit(allocator);
+    fields[0] = try Field.init(allocator, "t32s", .{ .time32 = .second }, true);
+    built += 1;
+    fields[1] = try Field.init(allocator, "t32m", .{ .time32 = .millisecond }, true);
+    built += 1;
+    fields[2] = try Field.init(allocator, "t64u", .{ .time64 = .microsecond }, true);
+    built += 1;
+    fields[3] = try Field.init(allocator, "dur", .{ .duration = .nanosecond }, false);
+    built += 1;
+    fields[4] = try Field.init(allocator, "zoned", zoned, true);
+    built += 1;
+    fields[5] = try Field.init(allocator, "naive", .{ .timestamp = .{ .unit = .second } }, true);
+    built += 1;
+    var schema = try Schema.init(allocator, fields[0..]);
+    defer schema.deinit(allocator);
+
+    const bytes = try encode(allocator, schema);
+    defer allocator.free(bytes);
+    var back = try decode(allocator, bytes);
+    defer back.deinit(allocator);
+
+    try testing.expect(schema.equals(back));
+    try testing.expectEqualStrings("Europe/Paris", back.field(4).data_type.timestamp.timezone.?);
+    try testing.expect(back.field(5).data_type.timestamp.timezone == null);
+}
+
+test "decode rejects a time whose unit and width disagree" {
     var b = Builder.init(testing.allocator);
     defer b.deinit();
 
-    const tz = try b.createString("UTC");
+    // A 64-bit time with the SECOND unit, which the spec does not pair.
     b.startTable();
-    try b.addScalar(i16, 0, 2, 0); // TimeUnit.MICROSECOND
-    try b.addOffset(1, tz);
-    const ts_type = try b.endTable();
+    try b.addScalar(i16, 0, 0, 1);
+    try b.addScalar(i32, 1, 64, 32);
+    const time_type = try b.endTable();
 
-    const field_name = try b.createString("ts");
+    const field_name = try b.createString("t");
     b.startTable();
     try b.addOffset(0, field_name);
-    try b.addScalar(bool, 1, true, false);
-    try b.addScalar(u8, 2, 10, 0); // Type.Timestamp
-    try b.addOffset(3, ts_type);
+    try b.addScalar(u8, 2, 9, 0); // Type.Time
+    try b.addOffset(3, time_type);
     const field_off = try b.endTable();
 
     try b.startVector(4, 1, 4);
@@ -565,7 +639,7 @@ test "decode rejects a timestamp with a timezone" {
     const root = try b.endTable();
     const buf = try b.finish(root);
 
-    try testing.expectError(error.UnsupportedType, decode(testing.allocator, buf));
+    try testing.expectError(error.MalformedSchema, decode(testing.allocator, buf));
 }
 
 test "decode rejects a type Zarr does not implement" {

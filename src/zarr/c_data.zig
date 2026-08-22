@@ -51,6 +51,9 @@ pub const Flags = struct {
 const SchemaPrivate = struct {
     allocator: Allocator,
     name: ?[:0]u8,
+    /// Owned format string, used when the static table cannot express the
+    /// type, such as a zoned timestamp.
+    format: ?[:0]u8 = null,
 };
 
 /// The `ArrowArray` struct of the Arrow C Data Interface. It carries the data
@@ -107,11 +110,31 @@ pub fn formatString(data_type: DataType) [:0]const u8 {
         .large_utf8 => "U",
         .date32 => "tdD",
         .date64 => "tdm",
-        .timestamp => |unit| switch (unit) {
+        // A zoned timestamp appends its timezone after the colon;
+        // `exportSchemaNamed` builds that owned string.
+        .timestamp => |ts| switch (ts.unit) {
             .second => "tss:",
             .millisecond => "tsm:",
             .microsecond => "tsu:",
             .nanosecond => "tsn:",
+        },
+        .time32 => |unit| switch (unit) {
+            .second => "tts",
+            .millisecond => "ttm",
+            // A 32-bit time only has second and millisecond units.
+            .microsecond, .nanosecond => unreachable,
+        },
+        .time64 => |unit| switch (unit) {
+            // A 64-bit time only has microsecond and nanosecond units.
+            .second, .millisecond => unreachable,
+            .microsecond => "ttu",
+            .nanosecond => "ttn",
+        },
+        .duration => |unit| switch (unit) {
+            .second => "tDs",
+            .millisecond => "tDm",
+            .microsecond => "tDu",
+            .nanosecond => "tDn",
         },
         .list => "+l",
         .@"struct" => "+s",
@@ -246,11 +269,19 @@ fn exportSchemaNamed(allocator: Allocator, data_type: DataType, name: ?[]const u
     errdefer if (owned_name) |nm| allocator.free(nm);
     if (name) |nm| owned_name = try allocator.dupeZ(u8, nm);
 
+    var owned_format: ?[:0]u8 = null;
+    errdefer if (owned_format) |f| allocator.free(f);
+    if (data_type == .timestamp) {
+        if (data_type.timestamp.timezone) |tz| {
+            owned_format = try std.fmt.allocPrintSentinel(allocator, "{s}{s}", .{ formatString(data_type), tz }, 0);
+        }
+    }
+
     const priv = try allocator.create(SchemaPrivate);
-    priv.* = .{ .allocator = allocator, .name = owned_name };
+    priv.* = .{ .allocator = allocator, .name = owned_name, .format = owned_format };
 
     out.* = .{
-        .format = formatString(data_type).ptr,
+        .format = if (owned_format) |f| f.ptr else formatString(data_type).ptr,
         .name = if (owned_name) |nm| nm.ptr else null,
         .metadata = null,
         .flags = if (nullable) Flags.nullable else 0,
@@ -279,6 +310,7 @@ fn releaseSchema(schema: *ArrowSchema) callconv(.c) void {
         allocator.free(cptr[0..n]);
     }
     if (priv.name) |nm| allocator.free(nm);
+    if (priv.format) |f| allocator.free(f);
     allocator.destroy(priv);
     schema.release = null;
 }
@@ -385,7 +417,7 @@ pub fn importSchema(allocator: Allocator, schema: *const ArrowSchema) ImportErro
     }.f;
 
     // Timestamp carries its unit in the third character and an optional
-    // timezone after the colon, which Zarr's type does not retain.
+    // timezone after the colon.
     if (fmt.len >= 4 and fmt[0] == 't' and fmt[1] == 's' and fmt[3] == ':') {
         const unit: TimeUnit = switch (fmt[2]) {
             's' => .second,
@@ -394,7 +426,8 @@ pub fn importSchema(allocator: Allocator, schema: *const ArrowSchema) ImportErro
             'n' => .nanosecond,
             else => return error.InvalidFormat,
         };
-        return .{ .timestamp = unit };
+        const tz = fmt[4..];
+        return DataType.initTimestamp(allocator, unit, if (tz.len == 0) null else tz);
     }
 
     if (eq(fmt, "n")) return .null;
@@ -416,6 +449,14 @@ pub fn importSchema(allocator: Allocator, schema: *const ArrowSchema) ImportErro
     if (eq(fmt, "U")) return .large_utf8;
     if (eq(fmt, "tdD")) return .date32;
     if (eq(fmt, "tdm")) return .date64;
+    if (eq(fmt, "tts")) return .{ .time32 = .second };
+    if (eq(fmt, "ttm")) return .{ .time32 = .millisecond };
+    if (eq(fmt, "ttu")) return .{ .time64 = .microsecond };
+    if (eq(fmt, "ttn")) return .{ .time64 = .nanosecond };
+    if (eq(fmt, "tDs")) return .{ .duration = .second };
+    if (eq(fmt, "tDm")) return .{ .duration = .millisecond };
+    if (eq(fmt, "tDu")) return .{ .duration = .microsecond };
+    if (eq(fmt, "tDn")) return .{ .duration = .nanosecond };
 
     if (eq(fmt, "+l")) {
         if (schema.n_children != 1 or schema.children == null) return error.InvalidFormat;
@@ -833,12 +874,12 @@ test "import schema round-trips a flat type" {
 
 test "import schema round-trips a timestamp with a unit" {
     var schema: ArrowSchema = undefined;
-    try exportSchema(testing.allocator, .{ .timestamp = .microsecond }, &schema);
+    try exportSchema(testing.allocator, .{ .timestamp = .{ .unit = .microsecond } }, &schema);
     defer schema.release.?(&schema);
 
     var dt = try importSchema(testing.allocator, &schema);
     defer dt.deinit(testing.allocator);
-    try testing.expect(dt.equals(.{ .timestamp = .microsecond }));
+    try testing.expect(dt.equals(.{ .timestamp = .{ .unit = .microsecond } }));
 }
 
 test "import schema round-trips a struct of list" {
@@ -1145,9 +1186,45 @@ test "import array slices a list array and trims the child" {
     try testing.expectEqualSlices(i32, &.{ 3, 4, 5 }, imported.child(0).values(i32));
 }
 
+test "temporal types round-trip through the C schema" {
+    const allocator = testing.allocator;
+    const flat = [_]DataType{
+        .{ .time32 = .second },
+        .{ .time32 = .millisecond },
+        .{ .time64 = .microsecond },
+        .{ .time64 = .nanosecond },
+        .{ .duration = .second },
+        .{ .duration = .nanosecond },
+    };
+    for (flat) |dt| {
+        var cs: ArrowSchema = undefined;
+        try exportSchema(allocator, dt, &cs);
+        defer cs.release.?(&cs);
+        var back = try importSchema(allocator, &cs);
+        defer back.deinit(allocator);
+        try testing.expect(back.equals(dt));
+    }
+}
+
+test "a zoned timestamp round-trips through the C schema" {
+    const allocator = testing.allocator;
+    var zoned = try DataType.initTimestamp(allocator, .microsecond, "Europe/Paris");
+    defer zoned.deinit(allocator);
+
+    var cs: ArrowSchema = undefined;
+    try exportSchema(allocator, zoned, &cs);
+    defer cs.release.?(&cs);
+    try testing.expectEqualStrings("tsu:Europe/Paris", std.mem.span(cs.format));
+
+    var back = try importSchema(allocator, &cs);
+    defer back.deinit(allocator);
+    try testing.expect(back.equals(zoned));
+    try testing.expectEqualStrings("Europe/Paris", back.timestamp.timezone.?);
+}
+
 test "export and import a field carry the name and nullability" {
     const allocator = testing.allocator;
-    var f = try Field.init(allocator, "score", .{ .timestamp = .microsecond }, true);
+    var f = try Field.init(allocator, "score", .{ .timestamp = .{ .unit = .microsecond } }, true);
     defer f.deinit(allocator);
 
     var cs: ArrowSchema = undefined;
@@ -1427,10 +1504,10 @@ test "format strings for null and variable-length types" {
 test "format strings for temporal types" {
     try testing.expectEqualStrings("tdD", formatString(.date32));
     try testing.expectEqualStrings("tdm", formatString(.date64));
-    try testing.expectEqualStrings("tss:", formatString(.{ .timestamp = .second }));
-    try testing.expectEqualStrings("tsm:", formatString(.{ .timestamp = .millisecond }));
-    try testing.expectEqualStrings("tsu:", formatString(.{ .timestamp = .microsecond }));
-    try testing.expectEqualStrings("tsn:", formatString(.{ .timestamp = .nanosecond }));
+    try testing.expectEqualStrings("tss:", formatString(.{ .timestamp = .{ .unit = .second } }));
+    try testing.expectEqualStrings("tsm:", formatString(.{ .timestamp = .{ .unit = .millisecond } }));
+    try testing.expectEqualStrings("tsu:", formatString(.{ .timestamp = .{ .unit = .microsecond } }));
+    try testing.expectEqualStrings("tsn:", formatString(.{ .timestamp = .{ .unit = .nanosecond } }));
 }
 
 test "format strings for nested types describe only the outer layer" {

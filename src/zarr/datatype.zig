@@ -17,6 +17,20 @@ pub const TimeUnit = enum {
     nanosecond,
 };
 
+/// Parameters of a timestamp type: a unit, and an optional timezone name
+/// such as "UTC". A null timezone means the timestamp is zone-naive. The
+/// timezone string is owned by the type when it was built with
+/// `initTimestamp`; release through `DataType.deinit`.
+pub const TimestampType = struct {
+    unit: TimeUnit,
+    timezone: ?[]const u8 = null,
+};
+
+fn optStrEq(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
 /// A named, typed, nullable column or child descriptor.
 pub const Field = struct {
     /// Name; owned by this field.
@@ -82,7 +96,13 @@ pub const DataType = union(enum) {
     date32,
     /// Milliseconds since the UNIX epoch, stored as i64.
     date64,
-    timestamp: TimeUnit,
+    timestamp: TimestampType,
+    /// Time of day as i32, in seconds or milliseconds since midnight.
+    time32: TimeUnit,
+    /// Time of day as i64, in microseconds or nanoseconds since midnight.
+    time64: TimeUnit,
+    /// An elapsed amount of time as i64, in the given unit.
+    duration: TimeUnit,
     /// A list of a single child element field (32-bit offsets), whose name
     /// is conventionally "item". Owns a heap-allocated child field; release
     /// it with `deinit`.
@@ -97,10 +117,18 @@ pub const DataType = union(enum) {
             .boolean => 1,
             .int8, .uint8 => 8,
             .int16, .uint16, .float16 => 16,
-            .int32, .uint32, .float32, .date32 => 32,
-            .int64, .uint64, .float64, .date64, .timestamp => 64,
+            .int32, .uint32, .float32, .date32, .time32 => 32,
+            .int64, .uint64, .float64, .date64, .timestamp, .time64, .duration => 64,
             .null, .binary, .utf8, .large_binary, .large_utf8, .list, .@"struct" => null,
         };
+    }
+
+    /// Builds a timestamp type owning a copy of `timezone`, or a zone-naive
+    /// timestamp when `timezone` is null. The caller retains ownership of the
+    /// argument and must release the returned type with `deinit`.
+    pub fn initTimestamp(allocator: Allocator, unit: TimeUnit, timezone: ?[]const u8) Allocator.Error!DataType {
+        const owned = if (timezone) |tz| try allocator.dupe(u8, tz) else null;
+        return .{ .timestamp = .{ .unit = unit, .timezone = owned } };
     }
 
     /// Builds a list type from a bare element type, wrapping it in the
@@ -163,6 +191,7 @@ pub const DataType = union(enum) {
     /// Deep-copies this type, including any heap-owned children.
     pub fn clone(self: DataType, allocator: Allocator) Allocator.Error!DataType {
         return switch (self) {
+            .timestamp => |ts| try initTimestamp(allocator, ts.unit, ts.timezone),
             .list => |child| try initListField(allocator, child.*),
             .@"struct" => |fields| try initStructFields(allocator, fields),
             else => self,
@@ -172,6 +201,7 @@ pub const DataType = union(enum) {
     /// Frees any heap memory owned by nested types. A no-op for flat types.
     pub fn deinit(self: *DataType, allocator: Allocator) void {
         switch (self.*) {
+            .timestamp => |ts| if (ts.timezone) |tz| allocator.free(tz),
             .list => |child| {
                 @constCast(child).deinit(allocator);
                 allocator.destroy(child);
@@ -189,7 +219,11 @@ pub const DataType = union(enum) {
     pub fn equals(self: DataType, other: DataType) bool {
         if (std.meta.activeTag(self) != std.meta.activeTag(other)) return false;
         return switch (self) {
-            .timestamp => |unit| unit == other.timestamp,
+            .timestamp => |ts| ts.unit == other.timestamp.unit and
+                optStrEq(ts.timezone, other.timestamp.timezone),
+            .time32 => |unit| unit == other.time32,
+            .time64 => |unit| unit == other.time64,
+            .duration => |unit| unit == other.duration,
             .list => |child| child.equals(other.list.*),
             .@"struct" => |fields| blk: {
                 const others = other.@"struct";
@@ -210,7 +244,10 @@ pub const DataType = union(enum) {
     pub fn equalsLayout(self: DataType, other: DataType) bool {
         if (std.meta.activeTag(self) != std.meta.activeTag(other)) return false;
         return switch (self) {
-            .timestamp => |unit| unit == other.timestamp,
+            .timestamp => |ts| ts.unit == other.timestamp.unit,
+            .time32 => |unit| unit == other.time32,
+            .time64 => |unit| unit == other.time64,
+            .duration => |unit| unit == other.duration,
             .list => |child| child.data_type.equalsLayout(other.list.data_type),
             .@"struct" => |fields| blk: {
                 const others = other.@"struct";
@@ -264,7 +301,7 @@ pub const DataType = union(enum) {
 test "bitWidth of primitives" {
     try std.testing.expectEqual(@as(?u16, 32), @as(DataType, .int32).bitWidth());
     try std.testing.expectEqual(@as(?u16, 1), @as(DataType, .boolean).bitWidth());
-    try std.testing.expectEqual(@as(?u16, 64), (DataType{ .timestamp = .millisecond }).bitWidth());
+    try std.testing.expectEqual(@as(?u16, 64), (DataType{ .timestamp = .{ .unit = .millisecond } }).bitWidth());
     try std.testing.expectEqual(@as(?u16, null), @as(DataType, .utf8).bitWidth());
 }
 
@@ -276,8 +313,8 @@ test "fromZigType" {
 test "equals compares flat types by tag and payload" {
     try std.testing.expect(@as(DataType, .int32).equals(.int32));
     try std.testing.expect(!@as(DataType, .int32).equals(.int64));
-    try std.testing.expect((DataType{ .timestamp = .second }).equals(.{ .timestamp = .second }));
-    try std.testing.expect(!(DataType{ .timestamp = .second }).equals(.{ .timestamp = .nanosecond }));
+    try std.testing.expect((DataType{ .timestamp = .{ .unit = .second } }).equals(.{ .timestamp = .{ .unit = .second } }));
+    try std.testing.expect(!(DataType{ .timestamp = .{ .unit = .second } }).equals(.{ .timestamp = .{ .unit = .nanosecond } }));
 }
 
 test "initList owns a deep copy of its child" {
@@ -421,4 +458,36 @@ test "initListField keeps the given child field" {
     try std.testing.expectEqualStrings("element", ty.list.name);
     try std.testing.expect(!ty.list.nullable);
     try std.testing.expect(ty.list.data_type.equals(.float64));
+}
+
+test "temporal types carry their units and bit widths" {
+    try std.testing.expectEqual(@as(?u16, 32), (DataType{ .time32 = .second }).bitWidth());
+    try std.testing.expectEqual(@as(?u16, 32), (DataType{ .time32 = .millisecond }).bitWidth());
+    try std.testing.expectEqual(@as(?u16, 64), (DataType{ .time64 = .microsecond }).bitWidth());
+    try std.testing.expectEqual(@as(?u16, 64), (DataType{ .duration = .nanosecond }).bitWidth());
+    try std.testing.expect((DataType{ .time32 = .second }).equals(.{ .time32 = .second }));
+    try std.testing.expect(!(DataType{ .time32 = .second }).equals(.{ .time32 = .millisecond }));
+    try std.testing.expect(!(DataType{ .time64 = .microsecond }).equals(.{ .duration = .microsecond }));
+}
+
+test "zoned timestamps own their timezone" {
+    const allocator = std.testing.allocator;
+    var utc = try DataType.initTimestamp(allocator, .second, "UTC");
+    defer utc.deinit(allocator);
+    var utc2 = try DataType.initTimestamp(allocator, .second, "UTC");
+    defer utc2.deinit(allocator);
+    var paris = try DataType.initTimestamp(allocator, .second, "Europe/Paris");
+    defer paris.deinit(allocator);
+    const naive = DataType{ .timestamp = .{ .unit = .second } };
+
+    try std.testing.expectEqualStrings("UTC", utc.timestamp.timezone.?);
+    try std.testing.expect(utc.equals(utc2));
+    try std.testing.expect(!utc.equals(paris));
+    try std.testing.expect(!utc.equals(naive));
+    try std.testing.expect(naive.equals(.{ .timestamp = .{ .unit = .second } }));
+    try std.testing.expectEqual(@as(?u16, 64), utc.bitWidth());
+
+    var copy = try utc.clone(allocator);
+    defer copy.deinit(allocator);
+    try std.testing.expectEqualStrings("UTC", copy.timestamp.timezone.?);
 }
