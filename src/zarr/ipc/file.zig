@@ -9,8 +9,9 @@
 //! prefix, and body length), so a reader can seek straight to any batch.
 //!
 //! `FileWriter` builds a file in memory, and `FileReader` opens one and reads
-//! batches by index. Dictionary batches are not implemented; a footer that
-//! lists any is reported as `error.UnsupportedMessage`.
+//! batches by index, loading the footer's dictionary batches up front so
+//! dictionary-encoded columns resolve. Writing dictionary-encoded schemas is
+//! not implemented yet.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,6 +20,7 @@ const Builder = flatbuffers.Builder;
 const ipc_schema = @import("schema.zig");
 const batch = @import("batch.zig");
 const stream = @import("stream.zig");
+const message = @import("message.zig");
 const Schema = @import("../schema.zig").Schema;
 const DataType = @import("../datatype.zig").DataType;
 const ArrayData = @import("../array_data.zig").ArrayData;
@@ -58,9 +60,11 @@ pub const FileWriter = struct {
 
     const Block = struct { offset: i64, metadata_length: i32, body_length: i64 };
 
-    /// Starts a file by writing the magic and the schema message. Release
-    /// with `deinit`.
-    pub fn init(allocator: Allocator, schema: Schema) Allocator.Error!FileWriter {
+    /// Starts a file by writing the magic and the schema message. Writing
+    /// dictionary-encoded schemas is not implemented yet and is refused.
+    /// Release with `deinit`.
+    pub fn init(allocator: Allocator, schema: Schema) (Allocator.Error || error{UnsupportedType})!FileWriter {
+        if (stream.schemaUsesDictionaries(schema)) return error.UnsupportedType;
         var self = FileWriter{
             .allocator = allocator,
             .buf = .empty,
@@ -155,6 +159,9 @@ pub const FileReader = struct {
     footer: flatbuffers.Table,
     /// Number of record batch blocks in the footer.
     count: usize,
+    /// Dictionary values by id, loaded from the footer's dictionary blocks;
+    /// owned by this reader and cloned into the arrays that use them.
+    dictionaries: batch.Dictionaries,
 
     /// Checks the magic at both ends and decodes the footer and schema.
     /// Release with `deinit`.
@@ -173,12 +180,29 @@ pub const FileReader = struct {
         if (footer_len > length_pos - 8) return error.InvalidFile;
         const footer = try flatbuffers.getRoot(bytes[length_pos - footer_len .. length_pos]);
 
-        if (try footer.vectorLen(footer_slot_dictionaries) != 0) return error.UnsupportedMessage;
         const schema_table = (try footer.readTable(footer_slot_schema)) orelse return error.InvalidFile;
         const count = try footer.vectorLen(footer_slot_record_batches);
+        const dictionary_count = try footer.vectorLen(footer_slot_dictionaries);
         var schema = try ipc_schema.readSchema(allocator, schema_table);
         errdefer schema.deinit(allocator);
-        const column_type = try stream.columnTypeOf(allocator, schema);
+        var column_type = try stream.columnTypeOf(allocator, schema);
+        errdefer column_type.deinit(allocator);
+
+        var dictionaries = batch.Dictionaries.init(allocator);
+        errdefer {
+            var it = dictionaries.valueIterator();
+            while (it.next()) |values| values.deinit();
+            dictionaries.deinit();
+        }
+        for (0..dictionary_count) |i| {
+            const msg_bytes = try blockSlice(bytes, footer, footer_slot_dictionaries, i);
+            const envelope = try message.decode(msg_bytes);
+            const msg = try flatbuffers.getRoot(envelope.metadata);
+            if (try msg.readScalar(u8, 1, 0) != 2) return error.InvalidFile; // MessageHeader.DictionaryBatch
+            const header = (try msg.readTable(2)) orelse return error.InvalidFile;
+            try stream.ingestDictionaryBatch(allocator, &dictionaries, schema, header, envelope.body);
+        }
+
         return .{
             .allocator = allocator,
             .bytes = bytes,
@@ -186,12 +210,16 @@ pub const FileReader = struct {
             .column_type = column_type,
             .footer = footer,
             .count = count,
+            .dictionaries = dictionaries,
         };
     }
 
     pub fn deinit(self: *FileReader) void {
         self.schema.deinit(self.allocator);
         self.column_type.deinit(self.allocator);
+        var it = self.dictionaries.valueIterator();
+        while (it.next()) |values| values.deinit();
+        self.dictionaries.deinit();
         self.* = undefined;
     }
 
@@ -205,19 +233,25 @@ pub const FileReader = struct {
     /// with `deinit`.
     pub fn readBatch(self: FileReader, i: usize) DecodeError!ArrayData {
         std.debug.assert(i < self.count);
-        const pos = try self.footer.vectorStructPos(footer_slot_record_batches, i, block_size);
-        const offset = try self.footer.scalarAt(i64, pos);
-        const metadata_length = try self.footer.scalarAt(i32, pos + 8);
-        const body_length = try self.footer.scalarAt(i64, pos + 16);
-        if (offset < 0 or metadata_length < 0 or body_length < 0) return error.InvalidFile;
-
-        const start: u64 = @intCast(offset);
-        const total: u64 = @as(u64, @intCast(metadata_length)) + @as(u64, @intCast(body_length));
-        if (start + total > self.bytes.len) return error.InvalidFile;
-        const msg = self.bytes[@intCast(start)..][0..@intCast(total)];
-        return stream.decodeBatchMessage(self.allocator, msg, self.column_type);
+        const msg = try blockSlice(self.bytes, self.footer, footer_slot_record_batches, i);
+        return stream.decodeBatchMessage(self.allocator, msg, self.column_type, &self.dictionaries);
     }
 };
+
+/// The encapsulated message bytes of block `i` in the footer vector at
+/// `slot`, bounds-checked against the file.
+fn blockSlice(bytes: []const u8, footer: flatbuffers.Table, slot: usize, i: usize) DecodeError![]const u8 {
+    const pos = try footer.vectorStructPos(slot, i, block_size);
+    const offset = try footer.scalarAt(i64, pos);
+    const metadata_length = try footer.scalarAt(i32, pos + 8);
+    const body_length = try footer.scalarAt(i64, pos + 16);
+    if (offset < 0 or metadata_length < 0 or body_length < 0) return error.InvalidFile;
+
+    const start: u64 = @intCast(offset);
+    const total: u64 = @as(u64, @intCast(metadata_length)) + @as(u64, @intCast(body_length));
+    if (start + total > bytes.len) return error.InvalidFile;
+    return bytes[@intCast(start)..][0..@intCast(total)];
+}
 
 const testing = std.testing;
 const PrimitiveArray = @import("../primitive_array.zig").PrimitiveArray;

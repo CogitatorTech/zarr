@@ -50,6 +50,9 @@ pub const ArrayData = struct {
     buffers: []?Buffer,
     /// Child arrays for nested types; owned.
     children: []Self,
+    /// Dictionary values for a dictionary-encoded array, delivered separately
+    /// from the indices this array stores; heap-allocated and owned.
+    dictionary: ?*Self = null,
 
     /// Number of buffers in the canonical layout of `data_type`, including the
     /// validity slot at index zero.
@@ -59,6 +62,7 @@ pub const ArrayData = struct {
             .binary, .utf8, .large_binary, .large_utf8 => 3, // validity, offsets, values
             .list => 2, // validity, offsets
             .@"struct", .fixed_size_list => 1, // validity only
+            .dictionary => 2, // validity, indices
             else => 2, // validity, values
         };
     }
@@ -99,6 +103,46 @@ pub const ArrayData = struct {
         return self;
     }
 
+    /// Assembles a dictionary-encoded array: `data_type` must be a
+    /// dictionary type, `buffers` holds the validity slot and the indices,
+    /// and `dictionary` holds the values array. Ownership follows `init`:
+    /// everything passed in is owned by the result on success and freed on
+    /// error.
+    pub fn initDictionary(
+        allocator: Allocator,
+        data_type: DataType,
+        length: usize,
+        null_count: usize,
+        buffers: []?Buffer,
+        dictionary: Self,
+    ) (Error || Allocator.Error)!Self {
+        std.debug.assert(data_type == .dictionary);
+        var self = Self{
+            .allocator = allocator,
+            .data_type = data_type,
+            .length = length,
+            .null_count = null_count,
+            .buffers = buffers,
+            .children = &.{},
+            .dictionary = null,
+        };
+        // Attach the values before validating, freeing everything through
+        // `deinit` on any failure so the caller never owns the parts.
+        var dict_values = dictionary;
+        const owned = allocator.create(Self) catch |err| {
+            dict_values.deinit();
+            self.deinit();
+            return err;
+        };
+        owned.* = dict_values;
+        self.dictionary = owned;
+        self.validate() catch |err| {
+            self.deinit();
+            return err;
+        };
+        return self;
+    }
+
     /// Frees the type, every buffer, every child, and their backing slices.
     pub fn deinit(self: *Self) void {
         for (self.buffers) |*maybe| {
@@ -107,8 +151,64 @@ pub const ArrayData = struct {
         self.allocator.free(self.buffers);
         for (self.children) |*nested| nested.deinit();
         self.allocator.free(self.children);
+        if (self.dictionary) |dict| {
+            dict.deinit();
+            self.allocator.destroy(dict);
+        }
         self.data_type.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Deep-copies this array: the type, every buffer, every child, and the
+    /// dictionary. The caller owns the returned data.
+    pub fn clone(self: Self, allocator: Allocator) Allocator.Error!Self {
+        var data_type = try self.data_type.clone(allocator);
+        errdefer data_type.deinit(allocator);
+
+        const buffers = try allocator.alloc(?Buffer, self.buffers.len);
+        for (buffers) |*slot| slot.* = null;
+        var built_buffers: usize = 0;
+        errdefer {
+            for (buffers[0..built_buffers]) |*maybe| if (maybe.*) |*buf| buf.deinit();
+            allocator.free(buffers);
+        }
+        for (self.buffers, 0..) |maybe, i| {
+            if (maybe) |buf| buffers[i] = try Buffer.dupe(allocator, buf.data);
+            built_buffers += 1;
+        }
+
+        const children = try allocator.alloc(Self, self.children.len);
+        var built_children: usize = 0;
+        errdefer {
+            for (children[0..built_children]) |*built| built.deinit();
+            allocator.free(children);
+        }
+        for (self.children, 0..) |nested, i| {
+            children[i] = try nested.clone(allocator);
+            built_children += 1;
+        }
+
+        var dictionary: ?*Self = null;
+        errdefer if (dictionary) |dict| {
+            dict.deinit();
+            allocator.destroy(dict);
+        };
+        if (self.dictionary) |dict| {
+            const owned = try allocator.create(Self);
+            errdefer allocator.destroy(owned);
+            owned.* = try dict.clone(allocator);
+            dictionary = owned;
+        }
+
+        return .{
+            .allocator = allocator,
+            .data_type = data_type,
+            .length = self.length,
+            .null_count = self.null_count,
+            .buffers = buffers,
+            .children = children,
+            .dictionary = dictionary,
+        };
     }
 
     /// The validity buffer, or null when the array carries none.
@@ -131,8 +231,11 @@ pub const ArrayData = struct {
     /// match the logical type's bit width; boolean values are bit-packed and
     /// are not read through this accessor.
     pub fn values(self: Self, comptime T: type) []const T {
-        std.debug.assert(self.data_type.isFixedWidth());
-        std.debug.assert(self.data_type.bitWidth().? == @bitSizeOf(T));
+        // A dictionary array's value buffer holds its indices, sized by the
+        // index type.
+        const width_type = if (self.data_type == .dictionary) self.data_type.dictionary.index.* else self.data_type;
+        std.debug.assert(width_type.isFixedWidth());
+        std.debug.assert(width_type.bitWidth().? == @bitSizeOf(T));
         return self.buffers[1].?.items(T)[0..self.length];
     }
 
@@ -184,6 +287,10 @@ pub const ArrayData = struct {
             .fixed_size_list => |fsl| {
                 if (!self.children[0].data_type.equals(fsl.child.data_type)) return error.ChildTypeMismatch;
             },
+            .dictionary => |d| {
+                const dict = self.dictionary orelse return error.ChildCountMismatch;
+                if (!dict.data_type.equals(d.value.*)) return error.ChildTypeMismatch;
+            },
             .@"struct" => |fields| {
                 for (fields, self.children) |field, nested| {
                     if (!nested.data_type.equals(field.data_type)) return error.ChildTypeMismatch;
@@ -227,6 +334,14 @@ pub const ArrayData = struct {
             .@"struct" => for (self.children) |nested| {
                 if (nested.length < self.length) return error.ChildLengthMismatch;
             },
+            .dictionary => |d| {
+                const dict = self.dictionary.?;
+                try dict.validateFull();
+                const index_buffer = self.buffers[1] orelse return error.BufferTooSmall;
+                const bits = d.index.bitWidth().?;
+                if (self.length > index_buffer.data.len / (bits / 8)) return error.BufferTooSmall;
+                try self.validateIndices(dict.length);
+            },
             .fixed_size_binary => |width| {
                 const value_buffer = self.buffers[1] orelse return error.BufferTooSmall;
                 const w: usize = @intCast(width);
@@ -246,6 +361,29 @@ pub const ArrayData = struct {
         }
 
         for (self.children) |nested| try nested.validateFull();
+    }
+
+    /// Checks that every valid dictionary index lies in `[0, limit)`.
+    fn validateIndices(self: Self, limit: usize) Error!void {
+        return switch (self.data_type.dictionary.index.*) {
+            .int8 => self.validateIndicesAs(i8, limit),
+            .int16 => self.validateIndicesAs(i16, limit),
+            .int32 => self.validateIndicesAs(i32, limit),
+            .int64 => self.validateIndicesAs(i64, limit),
+            .uint8 => self.validateIndicesAs(u8, limit),
+            .uint16 => self.validateIndicesAs(u16, limit),
+            .uint32 => self.validateIndicesAs(u32, limit),
+            .uint64 => self.validateIndicesAs(u64, limit),
+            else => error.ChildTypeMismatch,
+        };
+    }
+
+    fn validateIndicesAs(self: Self, comptime T: type, limit: usize) Error!void {
+        const indices = self.buffers[1].?.items(T)[0..self.length];
+        for (indices, 0..) |index, i| {
+            if (!self.isValid(i)) continue;
+            if (index < 0 or @as(u64, @intCast(index)) >= limit) return error.InvalidOffset;
+        }
     }
 
     /// Set bits among the first `length` bits of `bitmap`, which the caller
@@ -721,4 +859,96 @@ test "fixed-size list validates its child length" {
     var short_data = try ArrayData.init(allocator, list_type2, 2, 0, try buffersOf(allocator, &.{null}), try childrenOf(allocator, &.{short_child}));
     defer short_data.deinit();
     try testing.expectError(error.ChildLengthMismatch, short_data.validateFull());
+}
+
+/// Builds a small utf8 dictionary ["x", "yy"] for dictionary tests.
+fn testDictionaryValues(allocator: Allocator) !ArrayData {
+    var offsets = try Buffer.alloc(allocator, 3 * @sizeOf(i32));
+    const off = offsets.items(i32);
+    off[0] = 0;
+    off[1] = 1;
+    off[2] = 3;
+    const values = try Buffer.dupe(allocator, "xyy");
+    return ArrayData.init(allocator, .utf8, 2, 0, try buffersOf(allocator, &.{ null, offsets, values }), try childrenOf(allocator, &.{}));
+}
+
+test "dictionary arrays validate their indices against the dictionary" {
+    const allocator = testing.allocator;
+    const dict_type = try DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    var indices = try Buffer.alloc(allocator, 3);
+    indices.items(i8)[0] = 1;
+    indices.items(i8)[1] = 0;
+    indices.items(i8)[2] = 1;
+
+    var data = try ArrayData.initDictionary(
+        allocator,
+        dict_type,
+        3,
+        0,
+        try buffersOf(allocator, &.{ null, indices }),
+        try testDictionaryValues(allocator),
+    );
+    defer data.deinit();
+
+    try data.validateFull();
+    try testing.expectEqual(@as(usize, 2), data.dictionary.?.length);
+}
+
+test "validateFull rejects an index past the dictionary" {
+    const allocator = testing.allocator;
+    const dict_type = try DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    var indices = try Buffer.alloc(allocator, 2);
+    indices.items(i8)[0] = 0;
+    indices.items(i8)[1] = 2; // the dictionary has 2 entries: 0 and 1
+    var data = try ArrayData.initDictionary(
+        allocator,
+        dict_type,
+        2,
+        0,
+        try buffersOf(allocator, &.{ null, indices }),
+        try testDictionaryValues(allocator),
+    );
+    defer data.deinit();
+    try testing.expectError(error.InvalidOffset, data.validateFull());
+}
+
+test "validateFull rejects a negative dictionary index" {
+    const allocator = testing.allocator;
+    const dict_type = try DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    var indices = try Buffer.alloc(allocator, 1);
+    indices.items(i8)[0] = -1;
+    var data = try ArrayData.initDictionary(
+        allocator,
+        dict_type,
+        1,
+        0,
+        try buffersOf(allocator, &.{ null, indices }),
+        try testDictionaryValues(allocator),
+    );
+    defer data.deinit();
+    try testing.expectError(error.InvalidOffset, data.validateFull());
+}
+
+test "array data deep clone is independent" {
+    const allocator = testing.allocator;
+    const dict_type = try DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    var indices = try Buffer.alloc(allocator, 2);
+    indices.items(i8)[0] = 0;
+    indices.items(i8)[1] = 1;
+    var original = try ArrayData.initDictionary(
+        allocator,
+        dict_type,
+        2,
+        0,
+        try buffersOf(allocator, &.{ null, indices }),
+        try testDictionaryValues(allocator),
+    );
+
+    var copy = try original.clone(allocator);
+    defer copy.deinit();
+    original.deinit();
+
+    try copy.validateFull();
+    try testing.expectEqual(@as(usize, 2), copy.length);
+    try testing.expectEqualStrings("yy", copy.dictionary.?.valueBytes(1));
 }

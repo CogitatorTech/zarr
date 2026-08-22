@@ -137,8 +137,9 @@ pub fn formatString(data_type: DataType) [:0]const u8 {
             .nanosecond => "tDn",
         },
         // Decimal and fixed-size formats embed their parameters, so
-        // `exportSchemaNamed` builds them as owned strings.
-        .decimal128, .decimal256, .fixed_size_binary, .fixed_size_list => unreachable,
+        // `exportSchemaNamed` builds them as owned strings. Dictionary export
+        // over the C interface is not implemented yet.
+        .decimal128, .decimal256, .fixed_size_binary, .fixed_size_list, .dictionary => unreachable,
         .list => "+l",
         .@"struct" => "+s",
     };
@@ -668,6 +669,8 @@ fn importArraySlice(
             children[0] = try importArraySlice(allocator, fsl.child.data_type, array.children.?[0], total * size, length * size);
             built_children = 1;
         },
+        // Dictionary import over the C interface is not implemented yet.
+        .dictionary => return error.InvalidFormat,
         else => {
             const width = data_type.bitWidth().? / 8;
             const src = bufferAt(array, 1) orelse return error.InvalidFormat;

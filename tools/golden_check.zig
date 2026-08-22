@@ -140,6 +140,14 @@ fn checkCase(
     defer expected_schema.deinit(allocator);
     const batches = case.get("batches").?.array.items;
 
+    var dicts_json = DictionariesJson.init(allocator);
+    defer dicts_json.deinit();
+    if (case.get("dictionaries")) |list| {
+        for (list.array.items) |entry| {
+            try dicts_json.put(entry.object.get("id").?.integer, entry);
+        }
+    }
+
     // Stream golden.
     const stream_name = try std.fmt.allocPrint(allocator, "{s}.stream", .{stem});
     defer allocator.free(stream_name);
@@ -167,7 +175,7 @@ fn checkCase(
             return err;
         }) orelse return error.MissingBatch;
         defer decoded.deinit();
-        try compareBatch(batch_json, decoded, expected_schema, totals);
+        try compareBatch(batch_json, decoded, expected_schema, &dicts_json, totals);
     }
     if (try reader.next() != null) return error.ExtraBatch;
 
@@ -184,7 +192,7 @@ fn checkCase(
     for (batches, 0..) |batch_json, i| {
         var decoded = try file_reader.readBatch(i);
         defer decoded.deinit();
-        try compareBatch(batch_json, decoded, expected_schema, totals);
+        try compareBatch(batch_json, decoded, expected_schema, &dicts_json, totals);
     }
 
     totals.verified_files += 1;
@@ -220,11 +228,37 @@ fn buildSchema(allocator: std.mem.Allocator, schema_json: std.json.Value) BuildE
 
 fn buildField(allocator: std.mem.Allocator, field_json: std.json.Value) BuildError!zarr.Field {
     const obj = field_json.object;
-    if (obj.get("dictionary") != null) return error.UnsupportedGolden;
     const name = obj.get("name").?.string;
     const nullable = obj.get("nullable").?.bool;
     var data_type = try buildType(allocator, obj);
     defer data_type.deinit(allocator);
+
+    if (obj.get("dictionary")) |dict_json| {
+        const encoding = dict_json.object;
+        const id = encoding.get("id").?.integer;
+        const ordered = if (encoding.get("isOrdered")) |o| o.bool else false;
+        const index_obj = encoding.get("indexType").?.object;
+        const bits = index_obj.get("bitWidth").?.integer;
+        const signed = index_obj.get("isSigned").?.bool;
+        const index_type: zarr.DataType = if (signed) switch (bits) {
+            8 => .int8,
+            16 => .int16,
+            32 => .int32,
+            64 => .int64,
+            else => return error.MalformedGolden,
+        } else switch (bits) {
+            8 => .uint8,
+            16 => .uint16,
+            32 => .uint32,
+            64 => .uint64,
+            else => return error.MalformedGolden,
+        };
+        var wrapped = try zarr.DataType.initDictionary(allocator, id, index_type, data_type, ordered);
+        data_type.deinit(allocator);
+        data_type = wrapped;
+        // Keep a single deinit path via the defer above.
+        wrapped = undefined;
+    }
     return zarr.Field.init(allocator, name, data_type, nullable);
 }
 
@@ -361,18 +395,20 @@ fn parseTimeUnit(type_obj: std.json.ObjectMap) BuildError!zarr.TimeUnit {
 
 // --- Value comparison ---
 
-fn compareBatch(batch_json: std.json.Value, data: zarr.ArrayData, schema: zarr.Schema, totals: *Totals) !void {
+const DictionariesJson = std.AutoHashMap(i64, std.json.Value);
+
+fn compareBatch(batch_json: std.json.Value, data: zarr.ArrayData, schema: zarr.Schema, dicts: *const DictionariesJson, totals: *Totals) !void {
     const obj = batch_json.object;
     const count: usize = @intCast(obj.get("count").?.integer);
     if (data.length != count) return error.RowCountMismatch;
     const columns = obj.get("columns").?.array.items;
     if (columns.len != schema.fieldCount()) return error.ColumnCountMismatch;
     for (columns, 0..) |column_json, i| {
-        try compareColumn(column_json, data.child(i), schema.field(i).data_type, totals);
+        try compareColumn(column_json, data.child(i), schema.field(i).data_type, dicts, totals);
     }
 }
 
-fn compareColumn(column_json: std.json.Value, data: zarr.ArrayData, data_type: zarr.DataType, totals: *Totals) !void {
+fn compareColumn(column_json: std.json.Value, data: zarr.ArrayData, data_type: zarr.DataType, dicts: *const DictionariesJson, totals: *Totals) !void {
     const obj = column_json.object;
     const count: usize = @intCast(obj.get("count").?.integer);
     if (data.length != count) return error.RowCountMismatch;
@@ -426,7 +462,7 @@ fn compareColumn(column_json: std.json.Value, data: zarr.ArrayData, data_type: z
         },
         .fixed_size_list => |fsl| {
             const child_json = obj.get("children").?.array.items[0];
-            try compareColumn(child_json, data.child(0), fsl.child.data_type, totals);
+            try compareColumn(child_json, data.child(0), fsl.child.data_type, dicts, totals);
         },
         .float16 => try compareFloats(obj, data, f16, totals),
         .float32 => try compareFloats(obj, data, f32, totals),
@@ -438,13 +474,32 @@ fn compareColumn(column_json: std.json.Value, data: zarr.ArrayData, data_type: z
         .list => |child_field| {
             try compareOffsets(obj, data, i32, totals);
             const child_json = obj.get("children").?.array.items[0];
-            try compareColumn(child_json, data.child(0), child_field.data_type, totals);
+            try compareColumn(child_json, data.child(0), child_field.data_type, dicts, totals);
+        },
+        .dictionary => |d| {
+            // The column carries indices; the dictionary values are compared
+            // against the file's dictionaries section.
+            switch (d.index.*) {
+                .int8 => try compareInts(obj, data, i8, totals),
+                .int16 => try compareInts(obj, data, i16, totals),
+                .int32 => try compareInts(obj, data, i32, totals),
+                .int64 => try compareInts(obj, data, i64, totals),
+                .uint8 => try compareInts(obj, data, u8, totals),
+                .uint16 => try compareInts(obj, data, u16, totals),
+                .uint32 => try compareInts(obj, data, u32, totals),
+                .uint64 => try compareInts(obj, data, u64, totals),
+                else => return error.MalformedGolden,
+            }
+            const dict_json = dicts.get(d.id) orelse return error.MalformedGolden;
+            const dict_batch = dict_json.object.get("data").?.object;
+            const dict_column = dict_batch.get("columns").?.array.items[0];
+            try compareColumn(dict_column, data.dictionary.?.*, d.value.*, dicts, totals);
         },
         .@"struct" => |fields| {
             const children = obj.get("children").?.array.items;
             if (children.len != fields.len) return error.ColumnCountMismatch;
             for (children, 0..) |child_json, i| {
-                try compareColumn(child_json, data.child(i), fields[i].data_type, totals);
+                try compareColumn(child_json, data.child(i), fields[i].data_type, dicts, totals);
             }
         },
     }

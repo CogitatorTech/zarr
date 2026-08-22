@@ -59,6 +59,7 @@ const field_slot_name = 0;
 const field_slot_nullable = 1;
 const field_slot_type_tag = 2;
 const field_slot_type = 3;
+const field_slot_dictionary = 4;
 const field_slot_children = 5;
 
 // `Schema` table slots in Schema.fbs: 0 endianness, 1 fields,
@@ -94,8 +95,20 @@ pub fn writeSchema(b: *Builder, schema: Schema) Allocator.Error!Offset {
 /// nullability come from the child fields nested types carry, so struct
 /// field names and list element names round-trip.
 fn writeField(b: *Builder, name: []const u8, data_type: DataType, nullable: bool) Allocator.Error!Offset {
+    // On the wire a dictionary-encoded field carries its VALUE type in the
+    // type union and its children, plus a DictionaryEncoding table naming the
+    // index type and dictionary id.
+    var dictionary_off: Offset = 0;
+    const wire_type = switch (data_type) {
+        .dictionary => |d| blk: {
+            dictionary_off = try writeDictionaryEncoding(b, d);
+            break :blk d.value.*;
+        },
+        else => data_type,
+    };
+
     var children_off: Offset = 0;
-    switch (data_type) {
+    switch (wire_type) {
         .list => |child| {
             const item = try writeField(b, child.name, child.data_type, child.nullable);
             try b.startVector(4, 1, 4);
@@ -125,7 +138,7 @@ fn writeField(b: *Builder, name: []const u8, data_type: DataType, nullable: bool
         else => {},
     }
 
-    const ty = try writeType(b, data_type);
+    const ty = try writeType(b, wire_type);
     const name_off = try b.createString(name);
 
     b.startTable();
@@ -133,7 +146,19 @@ fn writeField(b: *Builder, name: []const u8, data_type: DataType, nullable: bool
     try b.addScalar(bool, field_slot_nullable, nullable, false);
     try b.addScalar(u8, field_slot_type_tag, ty.tag, 0);
     try b.addOffset(field_slot_type, ty.offset);
+    try b.addOffset(field_slot_dictionary, dictionary_off);
     try b.addOffset(field_slot_children, children_off);
+    return b.endTable();
+}
+
+/// Writes a `DictionaryEncoding` table: id at slot 0, the index `Int` table
+/// at slot 1, and isOrdered at slot 2.
+fn writeDictionaryEncoding(b: *Builder, d: datatype.DictionaryType) Allocator.Error!Offset {
+    const index = try writeType(b, d.index.*);
+    b.startTable();
+    try b.addScalar(i64, 0, d.id, 0);
+    try b.addOffset(1, index.offset);
+    try b.addScalar(bool, 2, d.ordered, false);
     return b.endTable();
 }
 
@@ -185,6 +210,8 @@ fn writeType(b: *Builder, data_type: DataType) Allocator.Error!TypeOffset {
         },
         .list => writeEmptyType(b, type_list),
         .@"struct" => writeEmptyType(b, type_struct),
+        // writeField unwraps dictionary fields to their value type.
+        .dictionary => unreachable,
     };
 }
 
@@ -284,12 +311,50 @@ fn readField(allocator: Allocator, table: Table, depth: usize) DecodeError!Field
     if (depth > max_type_nesting) return error.MalformedSchema;
     var data_type = try readType(allocator, table, depth);
     errdefer data_type.deinit(allocator);
+
+    if (try table.readTable(field_slot_dictionary)) |encoding| {
+        // DictionaryEncoding slots: 0 id, 1 index Int table, 2 isOrdered,
+        // 3 dictionaryKind (only DenseArray, 0, exists).
+        const id = try encoding.readScalar(i64, 0, 0);
+        const ordered = try encoding.readScalar(bool, 2, false);
+        var index_type: DataType = .int32; // the spec default when absent
+        if (try encoding.readTable(1)) |index_table| {
+            const bits = try index_table.readScalar(i32, 0, 0);
+            const signed = try index_table.readScalar(bool, 1, false);
+            index_type = intTypeFor(bits, signed) orelse return error.MalformedSchema;
+        }
+        const wrapped = try DataType.initDictionary(allocator, id, index_type, data_type, ordered);
+        data_type.deinit(allocator);
+        data_type = wrapped;
+    }
+
     // All fallible reads happen before the name is duped, so nothing leaks
     // when one of them fails.
     const nullable = try table.readScalar(bool, field_slot_nullable, false);
     const raw_name = (try table.readString(field_slot_name)) orelse "";
     const name = try allocator.dupe(u8, raw_name);
     return .{ .name = name, .data_type = data_type, .nullable = nullable };
+}
+
+/// The integer type with the given width and signedness, or null when the
+/// combination is not an Arrow integer type.
+fn intTypeFor(bits: i32, signed: bool) ?DataType {
+    if (signed) {
+        return switch (bits) {
+            8 => .int8,
+            16 => .int16,
+            32 => .int32,
+            64 => .int64,
+            else => null,
+        };
+    }
+    return switch (bits) {
+        8 => .uint8,
+        16 => .uint16,
+        32 => .uint32,
+        64 => .uint64,
+        else => null,
+    };
 }
 
 /// Nesting bound for `readField`. A hostile buffer can point a field's child
@@ -705,6 +770,29 @@ test "decimal and fixed-size types round-trip" {
     try testing.expect(schema.equals(back));
     try testing.expectEqual(@as(i32, 2), back.field(3).data_type.fixed_size_list.size);
     try testing.expectEqualStrings("item", back.field(3).data_type.fixed_size_list.child.name);
+}
+
+test "dictionary-encoded fields round-trip" {
+    const allocator = testing.allocator;
+
+    var dict_type = try DataType.initDictionary(allocator, 7, .int16, .utf8, true);
+    defer dict_type.deinit(allocator);
+    var category = try Field.init(allocator, "category", dict_type, true);
+    defer category.deinit(allocator);
+    var schema = try Schema.init(allocator, &.{category});
+    defer schema.deinit(allocator);
+
+    const bytes = try encode(allocator, schema);
+    defer allocator.free(bytes);
+    var back = try decode(allocator, bytes);
+    defer back.deinit(allocator);
+
+    try testing.expect(schema.equals(back));
+    const d = back.field(0).data_type.dictionary;
+    try testing.expectEqual(@as(i64, 7), d.id);
+    try testing.expect(d.index.equals(.int16));
+    try testing.expect(d.value.equals(.utf8));
+    try testing.expect(d.ordered);
 }
 
 test "decode rejects a decimal whose precision exceeds its width" {

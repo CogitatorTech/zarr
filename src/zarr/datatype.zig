@@ -40,6 +40,18 @@ pub const FixedSizeListType = struct {
     size: i32,
 };
 
+/// Parameters of a dictionary-encoded type: the integer index type stored in
+/// the array, the value type of the dictionary itself, whether the dictionary
+/// is ordered, and the dictionary id that ties IPC dictionary batches to the
+/// fields that use them. Both types are heap-owned; release through
+/// `DataType.deinit`.
+pub const DictionaryType = struct {
+    id: i64,
+    index: *const DataType,
+    value: *const DataType,
+    ordered: bool,
+};
+
 fn optStrEq(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(u8, a.?, b.?);
@@ -126,6 +138,10 @@ pub const DataType = union(enum) {
     /// Lists of one fixed element count, with no offsets buffer. Owns a
     /// heap-allocated child field; release it with `deinit`.
     fixed_size_list: FixedSizeListType,
+    /// Dictionary-encoded values: the array stores integer indices into a
+    /// dictionary of values delivered separately. Owns two heap-allocated
+    /// types; release it with `deinit`.
+    dictionary: DictionaryType,
     /// A list of a single child element field (32-bit offsets), whose name
     /// is conventionally "item". Owns a heap-allocated child field; release
     /// it with `deinit`.
@@ -144,7 +160,7 @@ pub const DataType = union(enum) {
             .int64, .uint64, .float64, .date64, .timestamp, .time64, .duration => 64,
             .decimal128 => 128,
             .decimal256 => 256,
-            .null, .binary, .utf8, .large_binary, .large_utf8, .list, .@"struct", .fixed_size_binary, .fixed_size_list => null,
+            .null, .binary, .utf8, .large_binary, .large_utf8, .list, .@"struct", .fixed_size_binary, .fixed_size_list, .dictionary => null,
         };
     }
 
@@ -172,6 +188,24 @@ pub const DataType = union(enum) {
         errdefer allocator.destroy(owned);
         owned.* = try field.clone(allocator);
         return .{ .fixed_size_list = .{ .child = owned, .size = size } };
+    }
+
+    /// Builds a dictionary type owning deep copies of the index and value
+    /// types. `index` must be an integer type. The caller retains ownership
+    /// of the arguments and must release the returned type with `deinit`.
+    pub fn initDictionary(allocator: Allocator, id: i64, index: DataType, value: DataType, ordered: bool) Allocator.Error!DataType {
+        std.debug.assert(switch (index) {
+            .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64 => true,
+            else => false,
+        });
+        const owned_index = try allocator.create(DataType);
+        errdefer allocator.destroy(owned_index);
+        owned_index.* = try index.clone(allocator);
+        errdefer @constCast(owned_index).deinit(allocator);
+        const owned_value = try allocator.create(DataType);
+        errdefer allocator.destroy(owned_value);
+        owned_value.* = try value.clone(allocator);
+        return .{ .dictionary = .{ .id = id, .index = owned_index, .value = owned_value, .ordered = ordered } };
     }
 
     /// Builds a list type from a bare element type, wrapping it in the
@@ -236,6 +270,7 @@ pub const DataType = union(enum) {
         return switch (self) {
             .timestamp => |ts| try initTimestamp(allocator, ts.unit, ts.timezone),
             .fixed_size_list => |fsl| try initFixedSizeListField(allocator, fsl.child.*, fsl.size),
+            .dictionary => |d| try initDictionary(allocator, d.id, d.index.*, d.value.*, d.ordered),
             .list => |child| try initListField(allocator, child.*),
             .@"struct" => |fields| try initStructFields(allocator, fields),
             else => self,
@@ -249,6 +284,12 @@ pub const DataType = union(enum) {
             .fixed_size_list => |fsl| {
                 @constCast(fsl.child).deinit(allocator);
                 allocator.destroy(fsl.child);
+            },
+            .dictionary => |d| {
+                @constCast(d.index).deinit(allocator);
+                allocator.destroy(d.index);
+                @constCast(d.value).deinit(allocator);
+                allocator.destroy(d.value);
             },
             .list => |child| {
                 @constCast(child).deinit(allocator);
@@ -277,6 +318,10 @@ pub const DataType = union(enum) {
             .fixed_size_binary => |width| width == other.fixed_size_binary,
             .fixed_size_list => |fsl| fsl.size == other.fixed_size_list.size and
                 fsl.child.equals(other.fixed_size_list.child.*),
+            // The id is IPC bookkeeping, not part of the type: the same
+            // logical schema may carry different ids from different writers.
+            .dictionary => |d| d.ordered == other.dictionary.ordered and
+                d.index.equals(other.dictionary.index.*) and d.value.equals(other.dictionary.value.*),
             .list => |child| child.equals(other.list.*),
             .@"struct" => |fields| blk: {
                 const others = other.@"struct";
@@ -306,6 +351,8 @@ pub const DataType = union(enum) {
             .fixed_size_binary => |width| width == other.fixed_size_binary,
             .fixed_size_list => |fsl| fsl.size == other.fixed_size_list.size and
                 fsl.child.data_type.equalsLayout(other.fixed_size_list.child.data_type),
+            .dictionary => |d| d.index.equalsLayout(other.dictionary.index.*) and
+                d.value.equalsLayout(other.dictionary.value.*),
             .list => |child| child.data_type.equalsLayout(other.list.data_type),
             .@"struct" => |fields| blk: {
                 const others = other.@"struct";
@@ -582,6 +629,33 @@ test "fixed-size list owns its child field and keeps its size" {
     defer wider.deinit(allocator);
     try std.testing.expect(ty.equals(same));
     try std.testing.expect(!ty.equals(wider));
+
+    var copy = try ty.clone(allocator);
+    defer copy.deinit(allocator);
+    try std.testing.expect(copy.equals(ty));
+}
+
+test "dictionary types pair an index type with a value type" {
+    const allocator = std.testing.allocator;
+    var ty = try DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    defer ty.deinit(allocator);
+
+    try std.testing.expectEqual(@as(i64, 0), ty.dictionary.id);
+    try std.testing.expect(ty.dictionary.index.equals(.int8));
+    try std.testing.expect(ty.dictionary.value.equals(.utf8));
+    try std.testing.expect(!ty.dictionary.ordered);
+    try std.testing.expectEqual(@as(?u16, null), ty.bitWidth());
+
+    var same = try DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    defer same.deinit(allocator);
+    var wider = try DataType.initDictionary(allocator, 0, .int32, .utf8, false);
+    defer wider.deinit(allocator);
+    var other_id = try DataType.initDictionary(allocator, 1, .int8, .utf8, false);
+    defer other_id.deinit(allocator);
+    try std.testing.expect(ty.equals(same));
+    try std.testing.expect(!ty.equals(wider));
+    // Ids are IPC bookkeeping and do not participate in type equality.
+    try std.testing.expect(ty.equals(other_id));
 
     var copy = try ty.clone(allocator);
     defer copy.deinit(allocator);

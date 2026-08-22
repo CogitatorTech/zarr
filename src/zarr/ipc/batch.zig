@@ -46,6 +46,11 @@ const batch_slot_compression = 3;
 /// Byte size of the `FieldNode` and `Buffer` structs: two i64 fields each.
 const struct_size = 16;
 
+/// Dictionary values by dictionary id, collected from dictionary batch
+/// messages by the stream and file readers. Values are owned by the map's
+/// owner and cloned into each decoded array that references them.
+pub const Dictionaries = std.AutoHashMap(i64, ArrayData);
+
 /// `length` rounded up to the next 8-byte boundary.
 fn padded(length: u64) u64 {
     return (length + 7) & ~@as(u64, 7);
@@ -197,7 +202,7 @@ fn countBuffers(data_type: DataType) usize {
 /// borrowed and cloned into the result. Buffer bytes are copied out of `body`
 /// into owned, aligned buffers, so `body` may be freed afterwards. The caller
 /// owns the returned data and must release it with `deinit`.
-pub fn readRecordBatch(allocator: Allocator, table: Table, data_type: DataType, body: []const u8) DecodeError!ArrayData {
+pub fn readRecordBatch(allocator: Allocator, table: Table, data_type: DataType, body: []const u8, dictionaries: ?*const Dictionaries) DecodeError!ArrayData {
     std.debug.assert(data_type == .@"struct");
     if (try table.readTable(batch_slot_compression) != null) return error.UnsupportedCompression;
 
@@ -227,7 +232,7 @@ pub fn readRecordBatch(allocator: Allocator, table: Table, data_type: DataType, 
             allocator.free(children);
         }
         for (column_fields, 0..) |column_field, i| {
-            children[i] = try readColumn(allocator, table, column_field.data_type, body, &node_i, &buffer_i);
+            children[i] = try readColumn(allocator, table, column_field.data_type, body, &node_i, &buffer_i, dictionaries);
             finished += 1;
         }
 
@@ -261,6 +266,7 @@ fn readColumn(
     body: []const u8,
     node_i: *usize,
     buffer_i: *usize,
+    dictionaries: ?*const Dictionaries,
 ) DecodeError!ArrayData {
     const node_pos = try table.vectorStructPos(batch_slot_nodes, node_i.*, struct_size);
     node_i.* += 1;
@@ -295,18 +301,40 @@ fn readColumn(
     }
     switch (data_type) {
         .list => |child_field| {
-            children[0] = try readColumn(allocator, table, child_field.data_type, body, node_i, buffer_i);
+            children[0] = try readColumn(allocator, table, child_field.data_type, body, node_i, buffer_i, dictionaries);
             finished += 1;
         },
         .fixed_size_list => |fsl| {
-            children[0] = try readColumn(allocator, table, fsl.child.data_type, body, node_i, buffer_i);
+            children[0] = try readColumn(allocator, table, fsl.child.data_type, body, node_i, buffer_i, dictionaries);
             finished += 1;
         },
         .@"struct" => |child_fields| for (child_fields, 0..) |child_field, i| {
-            children[i] = try readColumn(allocator, table, child_field.data_type, body, node_i, buffer_i);
+            children[i] = try readColumn(allocator, table, child_field.data_type, body, node_i, buffer_i, dictionaries);
             finished += 1;
         },
         else => {},
+    }
+
+    // A dictionary column stores only indices on the wire; the values were
+    // delivered by a dictionary batch and are cloned in here. Constructed as
+    // a literal so ownership stays with this frame until the return.
+    if (data_type == .dictionary) {
+        const dicts = dictionaries orelse return error.MalformedBatch;
+        const source = dicts.getPtr(data_type.dictionary.id) orelse return error.MalformedBatch;
+        const holder = try allocator.create(ArrayData);
+        errdefer allocator.destroy(holder);
+        holder.* = try source.clone(allocator);
+        errdefer holder.deinit();
+        const owned_type = try data_type.clone(allocator);
+        return .{
+            .allocator = allocator,
+            .data_type = owned_type,
+            .length = @intCast(length),
+            .null_count = @intCast(null_count),
+            .buffers = buffers,
+            .children = children,
+            .dictionary = holder,
+        };
     }
 
     const owned_type = try data_type.clone(allocator);
@@ -372,7 +400,7 @@ test "record batch columns round-trip through metadata and body" {
 
     var struct_type = try DataType.initStruct(allocator, &.{ .int32, .utf8 });
     defer struct_type.deinit(allocator);
-    var back = try readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body);
+    var back = try readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body, null);
     defer back.deinit();
 
     try testing.expectEqual(@as(usize, 3), back.length);
@@ -419,7 +447,7 @@ test "list column round-trips" {
     var struct_type = try DataType.initStruct(allocator, &.{list_type});
     list_type.deinit(allocator);
     defer struct_type.deinit(allocator);
-    var back = try readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body);
+    var back = try readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body, null);
     defer back.deinit();
 
     const tags = back.child(0);
@@ -451,7 +479,7 @@ test "zero-row batch round-trips" {
 
     var struct_type = try DataType.initStruct(allocator, &.{ .int32, .utf8 });
     defer struct_type.deinit(allocator);
-    var back = try readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body);
+    var back = try readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body, null);
     defer back.deinit();
 
     try testing.expectEqual(@as(usize, 0), back.length);
@@ -509,7 +537,7 @@ test "readRecordBatch reads a batch serialized by pyarrow" {
     list_type.deinit(allocator);
     defer struct_type.deinit(allocator);
 
-    var back = try readRecordBatch(allocator, batch_table, struct_type, body);
+    var back = try readRecordBatch(allocator, batch_table, struct_type, body, null);
     defer back.deinit();
 
     try testing.expectEqual(@as(usize, 3), back.length);
@@ -552,7 +580,7 @@ test "readRecordBatch rejects a compressed body" {
     defer struct_type.deinit(allocator);
     try testing.expectError(
         error.UnsupportedCompression,
-        readRecordBatch(allocator, try flatbuffers.getRoot(buf), struct_type, &.{}),
+        readRecordBatch(allocator, try flatbuffers.getRoot(buf), struct_type, &.{}, null),
     );
 }
 
@@ -570,7 +598,7 @@ test "readRecordBatch rejects a body too short for its buffers" {
     defer struct_type.deinit(allocator);
     try testing.expectError(
         error.MalformedBatch,
-        readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, &.{}),
+        readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, &.{}, null),
     );
 }
 
@@ -591,7 +619,7 @@ test "readRecordBatch rejects metadata that disagrees with the type" {
     defer struct_type.deinit(allocator);
     try testing.expectError(
         error.MalformedBatch,
-        readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body),
+        readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body, null),
     );
 }
 
@@ -630,7 +658,7 @@ test "readRecordBatch rejects a batch with corrupt offsets" {
     defer expected_type.deinit(allocator);
     try testing.expectError(
         error.InvalidOffset,
-        readRecordBatch(allocator, try flatbuffers.getRoot(metadata), expected_type, body),
+        readRecordBatch(allocator, try flatbuffers.getRoot(metadata), expected_type, body, null),
     );
 }
 
@@ -647,7 +675,7 @@ test "record batch serialization leaks nothing on allocation failure" {
             defer allocator.free(body);
             var struct_type = try DataType.initStruct(allocator, &.{ .int32, .utf8 });
             defer struct_type.deinit(allocator);
-            var back = try readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body);
+            var back = try readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body, null);
             back.deinit();
         }
     };

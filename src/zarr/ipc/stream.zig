@@ -8,8 +8,10 @@
 //! from `ipc/schema.zig`, and the record batch table from `ipc/batch.zig`.
 //!
 //! `StreamWriter` builds a stream in memory, and `StreamReader` walks one,
-//! returning each batch's columns as `ArrayData`. Dictionary batches are not
-//! implemented and are reported as `error.UnsupportedMessage`.
+//! returning each batch's columns as `ArrayData`. The reader collects
+//! dictionary batches into a map and attaches the values to the
+//! dictionary-encoded columns that reference them; dictionary deltas and
+//! writing dictionary-encoded schemas are not implemented yet.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,6 +21,7 @@ const message = @import("message.zig");
 const ipc_schema = @import("schema.zig");
 const batch = @import("batch.zig");
 const Schema = @import("../schema.zig").Schema;
+const Field = @import("../schema.zig").Field;
 const DataType = @import("../datatype.zig").DataType;
 const ArrayData = @import("../array_data.zig").ArrayData;
 
@@ -91,8 +94,11 @@ pub const StreamWriter = struct {
     allocator: Allocator,
     buf: std.ArrayListUnmanaged(u8),
 
-    /// Starts a stream by writing the schema message. Release with `deinit`.
-    pub fn init(allocator: Allocator, schema: Schema) Allocator.Error!StreamWriter {
+    /// Starts a stream by writing the schema message. Writing
+    /// dictionary-encoded schemas is not implemented yet and is refused.
+    /// Release with `deinit`.
+    pub fn init(allocator: Allocator, schema: Schema) (Allocator.Error || error{UnsupportedType})!StreamWriter {
+        if (schemaUsesDictionaries(schema)) return error.UnsupportedType;
         var self = StreamWriter{ .allocator = allocator, .buf = .empty };
         errdefer self.buf.deinit(allocator);
         const msg = try encodeSchemaMessage(allocator, schema);
@@ -135,6 +141,9 @@ pub const StreamReader = struct {
     /// The struct type over the schema's columns, used to decode each batch;
     /// owned by this reader.
     column_type: DataType,
+    /// Dictionary values by id, collected from dictionary batch messages;
+    /// owned by this reader and cloned into the arrays that use them.
+    dictionaries: batch.Dictionaries,
 
     /// Reads the schema message that starts the stream. Release with `deinit`.
     pub fn init(allocator: Allocator, bytes: []const u8) DecodeError!StreamReader {
@@ -155,12 +164,16 @@ pub const StreamReader = struct {
             .pos = 8 + envelope.metadata.len,
             .schema = schema,
             .column_type = column_type,
+            .dictionaries = batch.Dictionaries.init(allocator),
         };
     }
 
     pub fn deinit(self: *StreamReader) void {
         self.schema.deinit(self.allocator);
         self.column_type.deinit(self.allocator);
+        var it = self.dictionaries.valueIterator();
+        while (it.next()) |values| values.deinit();
+        self.dictionaries.deinit();
         self.* = undefined;
     }
 
@@ -168,32 +181,125 @@ pub const StreamReader = struct {
     /// end-of-stream marker or the end of the input. The caller owns the
     /// returned data and must release it with `deinit`.
     pub fn next(self: *StreamReader) DecodeError!?ArrayData {
-        if (self.pos >= self.bytes.len) return null;
-        const envelope = try message.decode(self.bytes[self.pos..]);
-        if (envelope.metadata.len == 0) {
-            // The end-of-stream marker; stay on it so further calls also
-            // return null.
-            return null;
+        while (true) {
+            if (self.pos >= self.bytes.len) return null;
+            const envelope = try message.decode(self.bytes[self.pos..]);
+            if (envelope.metadata.len == 0) {
+                // The end-of-stream marker; stay on it so further calls also
+                // return null.
+                return null;
+            }
+
+            const msg = try flatbuffers.getRoot(envelope.metadata);
+            const body_length = try msg.readScalar(i64, message_slot_body_length, 0);
+            if (body_length < 0) return error.Truncated;
+            const body_len: usize = @intCast(body_length);
+            if (envelope.body.len < body_len) return error.Truncated;
+            const advance = 8 + envelope.metadata.len + body_len;
+
+            switch (try msg.readScalar(u8, message_slot_header_tag, 0)) {
+                header_dictionary_batch => {
+                    const header = (try msg.readTable(message_slot_header)) orelse return error.MalformedBatch;
+                    try ingestDictionaryBatch(self.allocator, &self.dictionaries, self.schema, header, envelope.body[0..body_len]);
+                    self.pos += advance;
+                },
+                header_record_batch => {
+                    const header = (try msg.readTable(message_slot_header)) orelse return error.MalformedBatch;
+                    const data = try batch.readRecordBatch(self.allocator, header, self.column_type, envelope.body[0..body_len], &self.dictionaries);
+                    self.pos += advance;
+                    return data;
+                },
+                header_schema => return error.UnexpectedMessage,
+                else => return error.UnsupportedMessage,
+            }
         }
-
-        const msg = try flatbuffers.getRoot(envelope.metadata);
-        const body_length = try msg.readScalar(i64, message_slot_body_length, 0);
-        if (body_length < 0) return error.Truncated;
-        const body_len: usize = @intCast(body_length);
-        if (envelope.body.len < body_len) return error.Truncated;
-
-        const data = try decodeBatchMessage(self.allocator, self.bytes[self.pos..], self.column_type);
-        self.pos += 8 + envelope.metadata.len + body_len;
-        return data;
     }
 };
+
+/// Whether any field in `schema` uses dictionary encoding, at any nesting
+/// depth. The writers refuse such schemas until dictionary writing lands.
+pub fn schemaUsesDictionaries(schema: Schema) bool {
+    for (schema.fields) |f| {
+        if (typeUsesDictionaries(f.data_type)) return true;
+    }
+    return false;
+}
+
+fn typeUsesDictionaries(data_type: DataType) bool {
+    return switch (data_type) {
+        .dictionary => true,
+        .list => |child| typeUsesDictionaries(child.data_type),
+        .fixed_size_list => |fsl| typeUsesDictionaries(fsl.child.data_type),
+        .@"struct" => |fields| for (fields) |f| {
+            if (typeUsesDictionaries(f.data_type)) break true;
+        } else false,
+        else => false,
+    };
+}
+
+/// The value type of the dictionary with the given id, found anywhere in the
+/// schema, or null when no field references it. Borrowed from the schema.
+pub fn dictionaryValueType(schema: Schema, id: i64) ?DataType {
+    for (schema.fields) |f| {
+        if (findDictionaryValue(f.data_type, id)) |value| return value;
+    }
+    return null;
+}
+
+fn findDictionaryValue(data_type: DataType, id: i64) ?DataType {
+    return switch (data_type) {
+        .dictionary => |d| if (d.id == id) d.value.* else findDictionaryValue(d.value.*, id),
+        .list => |child| findDictionaryValue(child.data_type, id),
+        .fixed_size_list => |fsl| findDictionaryValue(fsl.child.data_type, id),
+        .@"struct" => |fields| for (fields) |f| {
+            if (findDictionaryValue(f.data_type, id)) |value| break value;
+        } else null,
+        else => null,
+    };
+}
+
+/// Decodes one `DictionaryBatch` header and stores its values in `map`,
+/// replacing any previous values for the same id. Deltas are not implemented.
+/// Used by the stream reader for inline messages and by the file reader for
+/// footer dictionary blocks.
+pub fn ingestDictionaryBatch(
+    allocator: Allocator,
+    map: *batch.Dictionaries,
+    schema: Schema,
+    dict_table: flatbuffers.Table,
+    body: []const u8,
+) DecodeError!void {
+    // DictionaryBatch slots (Message.fbs): 0 id, 1 data, 2 isDelta.
+    const id = try dict_table.readScalar(i64, 0, 0);
+    if (try dict_table.readScalar(bool, 2, false)) return error.UnsupportedMessage;
+    const data_table = (try dict_table.readTable(1)) orelse return error.MalformedBatch;
+    const value_type = dictionaryValueType(schema, id) orelse return error.MalformedBatch;
+
+    // The dictionary travels as a record batch with one column of the value
+    // type. Earlier dictionaries are passed along, so a dictionary whose
+    // values are themselves dictionary-encoded resolves against them.
+    var value_field = try Field.init(allocator, "", value_type, true);
+    defer value_field.deinit(allocator);
+    var wrapper = try DataType.initStructFields(allocator, &.{value_field});
+    defer wrapper.deinit(allocator);
+
+    var decoded = try batch.readRecordBatch(allocator, data_table, wrapper, body, map);
+    defer decoded.deinit();
+    if (decoded.children.len != 1) return error.MalformedBatch;
+    var values = try decoded.children[0].clone(allocator);
+    errdefer values.deinit();
+
+    const slot = try map.getOrPut(id);
+    if (slot.found_existing) slot.value_ptr.deinit();
+    slot.value_ptr.* = values;
+}
 
 /// Decodes one encapsulated record batch message at the start of `bytes` into
 /// the struct-typed columns it holds. `column_type` is the struct type over
 /// the schema's column types, as `columnTypeOf` builds. Used by the stream
 /// reader for the next message and by the file reader for random access. The
 /// caller owns the returned data.
-pub fn decodeBatchMessage(allocator: Allocator, bytes: []const u8, column_type: DataType) DecodeError!ArrayData {
+pub fn decodeBatchMessage(allocator: Allocator, bytes: []const u8, column_type: DataType, dictionaries: ?*const batch.Dictionaries) DecodeError!ArrayData {
     const envelope = try message.decode(bytes);
     if (envelope.metadata.len == 0) return error.UnexpectedMessage;
     const msg = try flatbuffers.getRoot(envelope.metadata);
@@ -209,7 +315,7 @@ pub fn decodeBatchMessage(allocator: Allocator, bytes: []const u8, column_type: 
         else => return error.UnsupportedMessage,
     }
     const header = (try msg.readTable(message_slot_header)) orelse return error.MalformedBatch;
-    return batch.readRecordBatch(allocator, header, column_type, envelope.body[0..body_len]);
+    return batch.readRecordBatch(allocator, header, column_type, envelope.body[0..body_len], dictionaries);
 }
 
 /// The struct type over a schema's fields, which is the shape of a batch's
@@ -223,7 +329,6 @@ const testing = std.testing;
 const PrimitiveArray = @import("../primitive_array.zig").PrimitiveArray;
 const Utf8Array = @import("../varbinary_array.zig").VarBinaryArray(true, i32);
 const StructArray = @import("../struct_array.zig").StructArray;
-const Field = @import("../schema.zig").Field;
 
 const PersonColumns = StructArray(&.{ PrimitiveArray(i32), Utf8Array });
 
@@ -455,6 +560,105 @@ test "reader returns errors on corrupt stream bytes instead of crashing" {
             data.deinit();
         }
     }
+}
+
+// A pyarrow 21 stream with a dictionary-encoded column:
+// category: dictionary<int8 -> utf8> and n: int32 not null. One dictionary
+// batch delivers ["red", "green", "blue"], then two record batches hold
+// indices {[0, 1, null, 0], n [1, 2, 3, 4]} and {[2, 2], n [5, 6]}.
+const pyarrow_dictionary_stream = [_]u8{
+    0xff, 0xff, 0xff, 0xff, 0xd8, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00,
+    0x0c, 0x00, 0x06, 0x00, 0x05, 0x00, 0x08, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x01, 0x04, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x74, 0xff, 0xff, 0xff, 0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x54, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x10, 0x00, 0x14, 0x00, 0x08, 0x00, 0x00, 0x00,
+    0x07, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+    0x10, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x6e, 0x00, 0x00, 0x00, 0xa8, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01,
+    0x20, 0x00, 0x00, 0x00, 0x10, 0x00, 0x18, 0x00, 0x08, 0x00, 0x06, 0x00, 0x07, 0x00, 0x0c, 0x00,
+    0x10, 0x00, 0x14, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x05, 0x14, 0x00, 0x00, 0x00,
+    0x48, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x00, 0x00, 0x63, 0x61, 0x74, 0x65, 0x67, 0x6f, 0x72, 0x79, 0x00, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x08, 0x00, 0x00, 0x00, 0x04, 0x00, 0x08, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x0c, 0x00, 0x08, 0x00, 0x07, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x00, 0x00, 0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0xa8, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0c, 0x00, 0x14, 0x00, 0x06, 0x00, 0x05, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x0c, 0x00, 0x00, 0x00,
+    0x00, 0x02, 0x04, 0x00, 0x14, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x04, 0x00, 0x08, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x0a, 0x00, 0x18, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, 0x0a, 0x00, 0x00, 0x00,
+    0x4c, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00,
+    0x72, 0x65, 0x64, 0x67, 0x72, 0x65, 0x65, 0x6e, 0x62, 0x6c, 0x75, 0x65, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0xb8, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0c, 0x00, 0x16, 0x00, 0x06, 0x00, 0x05, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x0c, 0x00, 0x00, 0x00,
+    0x00, 0x03, 0x04, 0x00, 0x18, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x0a, 0x00, 0x18, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, 0x0a, 0x00, 0x00, 0x00,
+    0x5c, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0xb8, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0c, 0x00, 0x16, 0x00, 0x06, 0x00, 0x05, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x0c, 0x00, 0x00, 0x00,
+    0x00, 0x03, 0x04, 0x00, 0x18, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x0a, 0x00, 0x18, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, 0x0a, 0x00, 0x00, 0x00,
+    0x5c, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+};
+
+test "reader decodes a dictionary-encoded stream written by pyarrow" {
+    const allocator = testing.allocator;
+
+    var reader = try StreamReader.init(allocator, &pyarrow_dictionary_stream);
+    defer reader.deinit();
+
+    const category = reader.schema.field(0);
+    try testing.expect(category.data_type == .dictionary);
+    try testing.expectEqual(@as(i64, 0), category.data_type.dictionary.id);
+    try testing.expect(category.data_type.dictionary.index.equals(.int8));
+    try testing.expect(category.data_type.dictionary.value.equals(.utf8));
+
+    var first = (try reader.next()) orelse return error.MissingBatch;
+    defer first.deinit();
+    try testing.expectEqual(@as(usize, 4), first.length);
+    const cat1 = first.child(0);
+    try testing.expect(!cat1.isValid(2));
+    const indices1 = cat1.values(i8);
+    try testing.expectEqual(@as(i8, 0), indices1[0]);
+    try testing.expectEqual(@as(i8, 1), indices1[1]);
+    try testing.expectEqual(@as(i8, 0), indices1[3]);
+    const dict = cat1.dictionary.?;
+    try testing.expectEqual(@as(usize, 3), dict.length);
+    try testing.expectEqualStrings("red", dict.valueBytes(0));
+    try testing.expectEqualStrings("green", dict.valueBytes(1));
+    try testing.expectEqualStrings("blue", dict.valueBytes(2));
+    try testing.expectEqualSlices(i32, &.{ 1, 2, 3, 4 }, first.child(1).values(i32));
+
+    var second = (try reader.next()) orelse return error.MissingBatch;
+    defer second.deinit();
+    try testing.expectEqual(@as(i8, 2), second.child(0).values(i8)[0]);
+    try testing.expectEqualStrings("blue", second.child(0).dictionary.?.valueBytes(2));
+    try testing.expectEqualSlices(i32, &.{ 5, 6 }, second.child(1).values(i32));
+
+    try testing.expectEqual(@as(?ArrayData, null), try reader.next());
 }
 
 test "stream serialization leaks nothing on allocation failure" {
