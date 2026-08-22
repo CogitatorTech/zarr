@@ -2,11 +2,13 @@
 //!
 //! This is the root of the `zarr_c` shared library, kept separate from the
 //! `zarr` module so the core stays free of a libc dependency. It exposes a
-//! small, fixed surface used to verify Zarr's C Data Interface against another
-//! Arrow implementation: one function exports a known sample record batch, and
-//! one imports a batch and checks it equals that sample. Both take the
-//! addresses of caller-allocated `ArrowSchema` and `ArrowArray` structs as
-//! integers, which is how cffi and ctypes pass them.
+//! small, fixed surface used to verify Zarr against another Arrow
+//! implementation, built around one known sample record batch. For the C Data
+//! Interface, one function exports the sample and one imports a batch and
+//! checks it equals the sample. For the IPC stream format, one function
+//! encodes the sample as a stream and one decodes a stream and checks it
+//! holds exactly the sample. Addresses and buffers are passed as integers,
+//! which is how cffi and ctypes pass them.
 //!
 //! The sample batch covers several layout families in one round trip:
 //!
@@ -71,6 +73,62 @@ export fn zarr_verify_sample_batch(schema_addr: usize, array_addr: usize) c_int 
     releaseBoth(in_schema, in_array);
 
     return if (batchMatchesSample(batch)) 0 else 1;
+}
+
+/// Encode the sample record batch as an Arrow IPC stream into the caller's
+/// buffer. Returns the number of bytes written, or -1 when encoding fails or
+/// the buffer is too small.
+export fn zarr_encode_sample_stream(out_addr: usize, capacity: usize) isize {
+    const out: [*]u8 = @ptrFromInt(out_addr);
+    const bytes = encodeSampleStream() catch return -1;
+    defer allocator.free(bytes);
+    if (bytes.len > capacity) return -1;
+    @memcpy(out[0..bytes.len], bytes);
+    return @intCast(bytes.len);
+}
+
+fn encodeSampleStream() ![]u8 {
+    var schema = try buildSchema();
+    defer schema.deinit(allocator);
+    var batch = try buildBatch(schema);
+    defer batch.deinit();
+    var data = try batch.toData(allocator);
+    defer data.deinit();
+
+    var writer = try zarr.ipc_stream.StreamWriter.init(allocator, schema);
+    defer writer.deinit();
+    try writer.writeBatch(data);
+    return writer.finish();
+}
+
+/// Decode an Arrow IPC stream and check it holds exactly the sample: the
+/// sample schema, one batch with the sample values, and nothing after it.
+/// Returns 0 on a match, 1 on a mismatch, and 2 when decoding fails.
+export fn zarr_verify_sample_stream(bytes_addr: usize, len: usize) c_int {
+    const bytes = @as([*]const u8, @ptrFromInt(bytes_addr))[0..len];
+    const matches = verifySampleStream(bytes) catch return 2;
+    return if (matches) 0 else 1;
+}
+
+fn verifySampleStream(bytes: []const u8) !bool {
+    var expected_schema = try buildSchema();
+    defer expected_schema.deinit(allocator);
+
+    var reader = try zarr.ipc_stream.StreamReader.init(allocator, bytes);
+    defer reader.deinit();
+    if (!expected_schema.equals(reader.schema)) return false;
+
+    var data = (try reader.next()) orelse return false;
+    defer data.deinit();
+    var batch = try SampleBatch.fromData(allocator, reader.schema, data);
+    defer batch.deinit();
+
+    var extra = try reader.next();
+    if (extra) |*d| {
+        d.deinit();
+        return false;
+    }
+    return batchMatchesSample(batch);
 }
 
 fn releaseBoth(schema: *ArrowSchema, array: *ArrowArray) void {
@@ -153,6 +211,15 @@ fn optBoolEq(a: ?bool, b: ?bool) bool {
 fn optBytesEq(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(u8, a.?, b.?);
+}
+
+test "sample stream round-trips through the C API entry points" {
+    // Encode fills the buffer with an IPC stream, then verify decodes it and
+    // compares it to the sample, in-process.
+    var buf: [4096]u8 = undefined;
+    const written = zarr_encode_sample_stream(@intFromPtr(&buf), buf.len);
+    try std.testing.expect(written > 0);
+    try std.testing.expectEqual(@as(c_int, 0), zarr_verify_sample_stream(@intFromPtr(&buf), @intCast(written)));
 }
 
 test "sample batch round-trips through the C API entry points" {
