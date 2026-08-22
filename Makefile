@@ -19,7 +19,7 @@ SHELL         := /usr/bin/env bash
 # Targets
 ################################################################################
 
-.PHONY: all build rebuild test format docs docs-serve clean release help shell setup-hooks test-hooks c-api interop
+.PHONY: all build rebuild test format docs docs-serve clean release help shell setup-hooks test-hooks c-api interop corpus
 .DEFAULT_GOAL := help
 
 help: ## Show the help messages for all targets
@@ -48,6 +48,10 @@ interop: c-api ## Round-trip the C Data Interface and the IPC stream against pya
 	uv run python test/interop/ipc_stream.py
 	@echo "Running the pyarrow IPC file round-trip..."
 	uv run python test/interop/ipc_file.py
+
+corpus: ## Run the arrow-testing IPC fuzz corpus through the IPC readers (skips if the submodule is absent)
+	@echo "Running the arrow-testing IPC fuzz-regression corpus..."
+	$(ZIG) build corpus-check $(BUILD_OPTS) -j$(JOBS)
 
 release: ## Build in Release mode
 	@echo "Building the project in Release mode..."

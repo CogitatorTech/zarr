@@ -41,6 +41,24 @@ pub fn build(b: *std.Build) void {
     const c_api_test_step = b.step("test-c-api", "Run C Data Interface library tests");
     c_api_test_step.dependOn(&run_c_api_tests.step);
 
+    // Fuzz-regression corpus check over the optional arrow-testing submodule,
+    // run on demand via `zig build corpus-check`. The tool skips and exits
+    // zero when the submodule is not initialized.
+    const corpus_module = b.createModule(.{
+        .root_source_file = b.path("tools/ipc_corpus_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    corpus_module.addImport("zarr", zarr_module);
+    const corpus_exe = b.addExecutable(.{
+        .name = "ipc-corpus-check",
+        .root_module = corpus_module,
+    });
+    const run_corpus = b.addRunArtifact(corpus_exe);
+    run_corpus.setCwd(b.path("."));
+    const corpus_step = b.step("corpus-check", "Run the arrow-testing IPC fuzz corpus through the IPC readers");
+    corpus_step.dependOn(&run_corpus.step);
+
     // Generate API documentation from the library root module (src/lib.zig).
     const docs_step = b.step("docs", "Generate API documentation");
     const install_docs = b.addInstallDirectory(.{

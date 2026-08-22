@@ -46,6 +46,9 @@ Priorities, in order:
 - `src/zarr/primitive_array.zig`: `PrimitiveArray`, a fixed-width primitive array and its builder.
 - `src/zarr/ipc/`: the Arrow IPC layer, layered as FlatBuffers runtime, message framing, schema and record batch serialization, and the stream and file formats.
 - `test/interop/`: pyarrow round-trip scripts run by `make interop`; they skip cleanly when pyarrow is absent.
+- `tools/`: development binaries wired through `build.zig`, such as the IPC corpus check; they are not part of the library.
+- `external/`: optional git submodules for differential testing (arrow-testing and nanoarrow). Nothing under `src/` may import them, and every
+  target that needs them skips cleanly when they are not initialized (`git submodule update --init`), so the library itself stays dependency-free.
 - `build.zig`: module definition, static library artifact, and the `test` and `docs` steps.
 - `build.zig.zon`: package metadata; minimum Zig version 0.16.0.
 - `Makefile`: development workflow wrapper around `zig build`.
@@ -113,6 +116,7 @@ Run the narrowest relevant checks, then expand if the change is wide.
 | Formatting | `zig fmt --check src build.zig build.zig.zon` | Any code change                        |
 | Build      | `make build`                                  | `build.zig` or `build.zig.zon` changed |
 | Docs       | `make docs`                                   | Public API doc comments changed        |
+| Corpus     | `make corpus`                                 | IPC decode paths changed (optional; skips without the arrow-testing submodule) |
 
 Minimum expectations:
 
