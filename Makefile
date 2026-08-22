@@ -41,9 +41,11 @@ c-api: ## Build the C Data Interface shared library (libzarr_c)
 	@echo "Building the C Data Interface shared library..."
 	$(ZIG) build c-api $(BUILD_OPTS) -j$(JOBS)
 
-interop: c-api ## Round-trip the C Data Interface against pyarrow (skips if pyarrow absent)
+interop: c-api ## Round-trip the C Data Interface and the IPC stream against pyarrow (skips if pyarrow absent)
 	@echo "Running the pyarrow C Data Interface round-trip..."
 	uv run python test/interop/roundtrip.py
+	@echo "Running the pyarrow IPC stream round-trip..."
+	uv run python test/interop/ipc_stream.py
 
 release: ## Build in Release mode
 	@echo "Building the project in Release mode..."
