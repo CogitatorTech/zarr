@@ -171,10 +171,11 @@ pub const FileReader = struct {
         const footer_len: usize = @intCast(footer_length);
         // The footer must fit between the 8-byte opening and its own length.
         if (footer_len > length_pos - 8) return error.InvalidFile;
-        const footer = flatbuffers.getRoot(bytes[length_pos - footer_len .. length_pos]);
+        const footer = try flatbuffers.getRoot(bytes[length_pos - footer_len .. length_pos]);
 
-        if (footer.vectorLen(footer_slot_dictionaries) != 0) return error.UnsupportedMessage;
-        const schema_table = footer.readTable(footer_slot_schema) orelse return error.InvalidFile;
+        if (try footer.vectorLen(footer_slot_dictionaries) != 0) return error.UnsupportedMessage;
+        const schema_table = (try footer.readTable(footer_slot_schema)) orelse return error.InvalidFile;
+        const count = try footer.vectorLen(footer_slot_record_batches);
         var schema = try ipc_schema.readSchema(allocator, schema_table);
         errdefer schema.deinit(allocator);
         const column_type = try stream.columnTypeOf(allocator, schema);
@@ -184,7 +185,7 @@ pub const FileReader = struct {
             .schema = schema,
             .column_type = column_type,
             .footer = footer,
-            .count = footer.vectorLen(footer_slot_record_batches),
+            .count = count,
         };
     }
 
@@ -204,10 +205,10 @@ pub const FileReader = struct {
     /// with `deinit`.
     pub fn readBatch(self: FileReader, i: usize) DecodeError!ArrayData {
         std.debug.assert(i < self.count);
-        const pos = self.footer.vectorStructPos(footer_slot_record_batches, i, block_size);
-        const offset = self.footer.scalarAt(i64, pos);
-        const metadata_length = self.footer.scalarAt(i32, pos + 8);
-        const body_length = self.footer.scalarAt(i64, pos + 16);
+        const pos = try self.footer.vectorStructPos(footer_slot_record_batches, i, block_size);
+        const offset = try self.footer.scalarAt(i64, pos);
+        const metadata_length = try self.footer.scalarAt(i32, pos + 8);
+        const body_length = try self.footer.scalarAt(i64, pos + 16);
         if (offset < 0 or metadata_length < 0 or body_length < 0) return error.InvalidFile;
 
         const start: u64 = @intCast(offset);
@@ -408,6 +409,23 @@ test "reader opens a file written by pyarrow" {
     try testing.expectEqualSlices(i32, &.{ 1, 2, 3 }, first.child(0).values(i32));
     try testing.expect(!first.child(1).isValid(1));
     try testing.expectEqualStrings("ccc", first.child(1).valueBytes(2));
+}
+
+test "reader returns errors on corrupt file bytes instead of crashing" {
+    const allocator = testing.allocator;
+    const copy = try allocator.dupe(u8, &pyarrow_file);
+    defer allocator.free(copy);
+    for (0..copy.len) |i| {
+        const original = copy[i];
+        defer copy[i] = original;
+        copy[i] = 0xff;
+        var reader = FileReader.init(allocator, copy) catch continue;
+        defer reader.deinit();
+        for (0..@min(reader.batchCount(), 4)) |b| {
+            var data = reader.readBatch(b) catch continue;
+            data.deinit();
+        }
+    }
 }
 
 test "file serialization leaks nothing on allocation failure" {

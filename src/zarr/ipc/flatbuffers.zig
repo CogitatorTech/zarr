@@ -202,99 +202,156 @@ pub const Builder = struct {
     }
 };
 
-/// A read-only view of a table within a finished FlatBuffers buffer.
+/// Errors from reading a malformed buffer: an offset, length, or field that
+/// runs outside the buffer, or a vtable that cannot be valid.
+pub const ReadError = error{MalformedFlatBuffers};
+
+/// A read-only view of a table within a finished FlatBuffers buffer. Buffers
+/// arriving over IPC are untrusted, so every read is bounds-checked and a
+/// corrupt or truncated buffer returns `error.MalformedFlatBuffers` instead
+/// of reading out of bounds.
 pub const Table = struct {
     buf: []const u8,
     pos: usize,
 
-    fn vtablePos(self: Table) usize {
+    /// Fails unless `[start, start + len)` lies inside the buffer.
+    fn checkRange(self: Table, start: usize, len: usize) ReadError!void {
+        if (start > self.buf.len or self.buf.len - start < len) {
+            return error.MalformedFlatBuffers;
+        }
+    }
+
+    /// Position of this table's vtable, validated to hold at least its two
+    /// header fields and to lie inside the buffer.
+    fn vtablePos(self: Table) ReadError!usize {
+        try self.checkRange(self.pos, 4);
         const soffset = std.mem.readInt(i32, self.buf[self.pos..][0..4], .little);
-        return @intCast(@as(i64, @intCast(self.pos)) - soffset);
+        const signed = @as(i64, @intCast(self.pos)) - soffset;
+        if (signed < 0) return error.MalformedFlatBuffers;
+        const vt: usize = @intCast(signed);
+        try self.checkRange(vt, 4);
+        const vt_size = std.mem.readInt(u16, self.buf[vt..][0..2], .little);
+        if (vt_size < 4) return error.MalformedFlatBuffers;
+        try self.checkRange(vt, vt_size);
+        return vt;
     }
 
     /// Absolute position of field `id`, or 0 when the field is absent.
-    fn fieldPos(self: Table, id: usize) usize {
-        const vt = self.vtablePos();
+    fn fieldPos(self: Table, id: usize) ReadError!usize {
+        const vt = try self.vtablePos();
         const vt_size = std.mem.readInt(u16, self.buf[vt..][0..2], .little);
         const entry = 4 + id * 2;
-        if (entry >= vt_size) return 0;
+        if (entry + 2 > vt_size) return 0;
         const voff = std.mem.readInt(u16, self.buf[vt + entry ..][0..2], .little);
         if (voff == 0) return 0;
         return self.pos + voff;
     }
 
     /// Read a scalar field, returning `default` when absent.
-    pub fn readScalar(self: Table, comptime T: type, id: usize, default: T) T {
-        const p = self.fieldPos(id);
+    pub fn readScalar(self: Table, comptime T: type, id: usize, default: T) ReadError!T {
+        const p = try self.fieldPos(id);
         if (p == 0) return default;
-        if (T == bool) return self.buf[p] != 0;
+        if (T == bool) {
+            try self.checkRange(p, 1);
+            return self.buf[p] != 0;
+        }
+        try self.checkRange(p, @sizeOf(T));
         return std.mem.readInt(T, self.buf[p..][0..@sizeOf(T)], .little);
     }
 
-    /// Follow an offset field, returning the target position or null when absent.
-    fn followField(self: Table, id: usize) ?usize {
-        const p = self.fieldPos(id);
+    /// Follow an offset field, returning the target position or null when
+    /// absent. The target is at most one past the end of the buffer; readers
+    /// of the target check the bounds of what they read there.
+    fn followField(self: Table, id: usize) ReadError!?usize {
+        const p = try self.fieldPos(id);
         if (p == 0) return null;
-        return p + std.mem.readInt(u32, self.buf[p..][0..4], .little);
+        try self.checkRange(p, 4);
+        const target = p + std.mem.readInt(u32, self.buf[p..][0..4], .little);
+        if (target > self.buf.len) return error.MalformedFlatBuffers;
+        return target;
     }
 
     /// Read a string field, or null when absent.
-    pub fn readString(self: Table, id: usize) ?[]const u8 {
-        const p = self.followField(id) orelse return null;
+    pub fn readString(self: Table, id: usize) ReadError!?[]const u8 {
+        const p = (try self.followField(id)) orelse return null;
+        try self.checkRange(p, 4);
         const len = std.mem.readInt(u32, self.buf[p..][0..4], .little);
+        try self.checkRange(p + 4, len);
         return self.buf[p + 4 ..][0..len];
     }
 
     /// Read a child table field, or null when absent.
-    pub fn readTable(self: Table, id: usize) ?Table {
-        const p = self.followField(id) orelse return null;
+    pub fn readTable(self: Table, id: usize) ReadError!?Table {
+        const p = (try self.followField(id)) orelse return null;
         return .{ .buf = self.buf, .pos = p };
     }
 
-    /// Number of elements in a vector field.
-    pub fn vectorLen(self: Table, id: usize) usize {
-        const p = self.followField(id) orelse return 0;
-        return std.mem.readInt(u32, self.buf[p..][0..4], .little);
+    /// Number of elements in a vector field. Bounded by the buffer length, so
+    /// a corrupt count cannot drive an oversized allocation.
+    pub fn vectorLen(self: Table, id: usize) ReadError!usize {
+        const p = (try self.followField(id)) orelse return 0;
+        try self.checkRange(p, 4);
+        const n = std.mem.readInt(u32, self.buf[p..][0..4], .little);
+        // Every element is at least one byte, so more elements than the bytes
+        // after the count is impossible.
+        if (n > self.buf.len - p - 4) return error.MalformedFlatBuffers;
+        return n;
+    }
+
+    /// Start position of element `i` of a vector field with `elem_size`-wide
+    /// elements, checking the element lies inside both the vector and the
+    /// buffer.
+    fn vectorElemPos(self: Table, id: usize, i: usize, elem_size: usize) ReadError!usize {
+        const p = (try self.followField(id)) orelse return error.MalformedFlatBuffers;
+        try self.checkRange(p, 4);
+        const n = std.mem.readInt(u32, self.buf[p..][0..4], .little);
+        if (i >= n) return error.MalformedFlatBuffers;
+        const elem = p + 4 + i * elem_size;
+        try self.checkRange(elem, elem_size);
+        return elem;
     }
 
     /// Read element `i` of a scalar vector field.
-    pub fn vectorScalar(self: Table, comptime T: type, id: usize, i: usize) T {
-        const p = self.followField(id).?;
-        const elem = p + 4 + i * @sizeOf(T);
+    pub fn vectorScalar(self: Table, comptime T: type, id: usize, i: usize) ReadError!T {
+        const elem = try self.vectorElemPos(id, i, @sizeOf(T));
         return std.mem.readInt(T, self.buf[elem..][0..@sizeOf(T)], .little);
     }
 
     /// Read element `i` of a vector of offsets (to tables or strings) as a table.
-    pub fn vectorTable(self: Table, id: usize, i: usize) Table {
-        const p = self.followField(id).?;
-        const elem = p + 4 + i * 4;
-        return .{ .buf = self.buf, .pos = elem + std.mem.readInt(u32, self.buf[elem..][0..4], .little) };
+    pub fn vectorTable(self: Table, id: usize, i: usize) ReadError!Table {
+        const elem = try self.vectorElemPos(id, i, 4);
+        const target = elem + std.mem.readInt(u32, self.buf[elem..][0..4], .little);
+        if (target > self.buf.len) return error.MalformedFlatBuffers;
+        return .{ .buf = self.buf, .pos = target };
     }
 
     /// Read element `i` of a vector of strings.
-    pub fn vectorString(self: Table, id: usize, i: usize) []const u8 {
-        const p = self.followField(id).?;
-        const elem = p + 4 + i * 4;
+    pub fn vectorString(self: Table, id: usize, i: usize) ReadError![]const u8 {
+        const elem = try self.vectorElemPos(id, i, 4);
         const str = elem + std.mem.readInt(u32, self.buf[elem..][0..4], .little);
+        try self.checkRange(str, 4);
         const len = std.mem.readInt(u32, self.buf[str..][0..4], .little);
+        try self.checkRange(str + 4, len);
         return self.buf[str + 4 ..][0..len];
     }
 
     /// Position of element `i` of a vector of `elem_size`-wide inline structs.
-    pub fn vectorStructPos(self: Table, id: usize, i: usize, elem_size: usize) usize {
-        const p = self.followField(id).?;
-        return p + 4 + i * elem_size;
+    pub fn vectorStructPos(self: Table, id: usize, i: usize, elem_size: usize) ReadError!usize {
+        return self.vectorElemPos(id, i, elem_size);
     }
 
     /// Read a little-endian scalar at an absolute position (for struct fields).
-    pub fn scalarAt(self: Table, comptime T: type, p: usize) T {
+    pub fn scalarAt(self: Table, comptime T: type, p: usize) ReadError!T {
+        try self.checkRange(p, @sizeOf(T));
         return std.mem.readInt(T, self.buf[p..][0..@sizeOf(T)], .little);
     }
 };
 
 /// The root table of a finished buffer.
-pub fn getRoot(buf: []const u8) Table {
+pub fn getRoot(buf: []const u8) ReadError!Table {
+    if (buf.len < 4) return error.MalformedFlatBuffers;
     const root = std.mem.readInt(u32, buf[0..4], .little);
+    if (root > buf.len) return error.MalformedFlatBuffers;
     return .{ .buf = buf, .pos = root };
 }
 
@@ -311,12 +368,12 @@ test "round-trip a table of scalars" {
     const root = try b.endTable();
     const buf = try b.finish(root);
 
-    const t = getRoot(buf);
-    try testing.expectEqual(@as(i32, 42), t.readScalar(i32, 0, 0));
-    try testing.expectEqual(@as(i64, -7), t.readScalar(i64, 1, 0));
-    try testing.expectEqual(true, t.readScalar(bool, 2, false));
-    try testing.expectEqual(@as(i16, 99), t.readScalar(i16, 3, 99)); // absent -> default
-    try testing.expectEqual(@as(i32, 5), t.readScalar(i32, 7, 5)); // beyond vtable -> default
+    const t = try getRoot(buf);
+    try testing.expectEqual(@as(i32, 42), try t.readScalar(i32, 0, 0));
+    try testing.expectEqual(@as(i64, -7), try t.readScalar(i64, 1, 0));
+    try testing.expectEqual(true, try t.readScalar(bool, 2, false));
+    try testing.expectEqual(@as(i16, 99), try t.readScalar(i16, 3, 99)); // absent -> default
+    try testing.expectEqual(@as(i32, 5), try t.readScalar(i32, 7, 5)); // beyond vtable -> default
 }
 
 test "round-trip a string and a scalar vector" {
@@ -336,12 +393,12 @@ test "round-trip a string and a scalar vector" {
     const root = try b.endTable();
     const buf = try b.finish(root);
 
-    const t = getRoot(buf);
-    try testing.expectEqualStrings("arrow", t.readString(0).?);
-    try testing.expectEqual(@as(usize, 3), t.vectorLen(1));
-    try testing.expectEqual(@as(i32, 10), t.vectorScalar(i32, 1, 0));
-    try testing.expectEqual(@as(i32, 30), t.vectorScalar(i32, 1, 2));
-    try testing.expect(t.readString(5) == null);
+    const t = try getRoot(buf);
+    try testing.expectEqualStrings("arrow", (try t.readString(0)).?);
+    try testing.expectEqual(@as(usize, 3), try t.vectorLen(1));
+    try testing.expectEqual(@as(i32, 10), try t.vectorScalar(i32, 1, 0));
+    try testing.expectEqual(@as(i32, 30), try t.vectorScalar(i32, 1, 2));
+    try testing.expect((try t.readString(5)) == null);
 }
 
 test "round-trip a vector of child tables" {
@@ -366,10 +423,10 @@ test "round-trip a vector of child tables" {
     const root = try b.endTable();
     const buf = try b.finish(root);
 
-    const t = getRoot(buf);
-    try testing.expectEqual(@as(usize, 2), t.vectorLen(0));
-    try testing.expectEqual(@as(i32, 100), t.vectorTable(0, 0).readScalar(i32, 0, 0));
-    try testing.expectEqual(@as(i32, 200), t.vectorTable(0, 1).readScalar(i32, 0, 0));
+    const t = try getRoot(buf);
+    try testing.expectEqual(@as(usize, 2), try t.vectorLen(0));
+    try testing.expectEqual(@as(i32, 100), try (try t.vectorTable(0, 0)).readScalar(i32, 0, 0));
+    try testing.expectEqual(@as(i32, 200), try (try t.vectorTable(0, 1)).readScalar(i32, 0, 0));
 }
 
 test "round-trip a vector of inline structs" {
@@ -394,14 +451,14 @@ test "round-trip a vector of inline structs" {
     const root = try b.endTable();
     const buf = try b.finish(root);
 
-    const t = getRoot(buf);
-    try testing.expectEqual(@as(usize, 2), t.vectorLen(0));
-    const p0 = t.vectorStructPos(0, 0, 16);
-    try testing.expectEqual(@as(i64, 5), t.scalarAt(i64, p0));
-    try testing.expectEqual(@as(i64, 1), t.scalarAt(i64, p0 + 8));
-    const p1 = t.vectorStructPos(0, 1, 16);
-    try testing.expectEqual(@as(i64, 9), t.scalarAt(i64, p1));
-    try testing.expectEqual(@as(i64, 2), t.scalarAt(i64, p1 + 8));
+    const t = try getRoot(buf);
+    try testing.expectEqual(@as(usize, 2), try t.vectorLen(0));
+    const p0 = try t.vectorStructPos(0, 0, 16);
+    try testing.expectEqual(@as(i64, 5), try t.scalarAt(i64, p0));
+    try testing.expectEqual(@as(i64, 1), try t.scalarAt(i64, p0 + 8));
+    const p1 = try t.vectorStructPos(0, 1, 16);
+    try testing.expectEqual(@as(i64, 9), try t.scalarAt(i64, p1));
+    try testing.expectEqual(@as(i64, 2), try t.scalarAt(i64, p1 + 8));
 }
 
 test "nested table field round-trips" {
@@ -418,9 +475,84 @@ test "nested table field round-trips" {
     const root = try b.endTable();
     const buf = try b.finish(root);
 
-    const t = getRoot(buf);
-    try testing.expectEqual(@as(i32, 88), t.readScalar(i32, 1, 0));
-    try testing.expectEqual(@as(i32, 7), t.readTable(0).?.readScalar(i32, 0, 0));
+    const t = try getRoot(buf);
+    try testing.expectEqual(@as(i32, 88), try t.readScalar(i32, 1, 0));
+    try testing.expectEqual(@as(i32, 7), try ((try t.readTable(0)).?).readScalar(i32, 0, 0));
+}
+
+test "reads reject buffers too small for a root offset" {
+    try testing.expectError(error.MalformedFlatBuffers, getRoot(&.{}));
+    try testing.expectError(error.MalformedFlatBuffers, getRoot(&.{ 1, 2, 3 }));
+}
+
+test "reads reject a root offset past the buffer" {
+    var buf = [_]u8{0} ** 8;
+    std.mem.writeInt(u32, buf[0..4], 100, .little);
+    try testing.expectError(error.MalformedFlatBuffers, getRoot(&buf));
+}
+
+test "reads reject a table whose vtable lies outside the buffer" {
+    // A root table at position 4 whose soffset points far before the buffer.
+    var buf = [_]u8{0} ** 8;
+    std.mem.writeInt(u32, buf[0..4], 4, .little);
+    std.mem.writeInt(i32, buf[4..8], 1000, .little);
+    const t = try getRoot(&buf);
+    try testing.expectError(error.MalformedFlatBuffers, t.readScalar(i32, 0, 0));
+}
+
+/// Exercises every read on a possibly corrupt buffer, ignoring errors. Any
+/// out-of-bounds access panics and fails the test run.
+fn probeReads(buf: []const u8) void {
+    const t = getRoot(buf) catch return;
+    inline for (0..4) |id| {
+        _ = t.readScalar(i64, id, 0) catch {};
+        _ = t.readString(id) catch {};
+        if (t.readTable(id) catch null) |child| {
+            _ = child.readScalar(i32, 0, 0) catch {};
+        }
+        const n = t.vectorLen(id) catch 0;
+        for (0..@min(n, 4)) |i| {
+            _ = t.vectorScalar(i32, id, i) catch {};
+            _ = t.vectorString(id, i) catch {};
+            if (t.vectorTable(id, i) catch null) |elem| {
+                _ = elem.readScalar(i32, 0, 0) catch {};
+            }
+            const pos = t.vectorStructPos(id, i, 16) catch continue;
+            _ = t.scalarAt(i64, pos) catch {};
+            _ = t.scalarAt(i64, pos + 8) catch {};
+        }
+    }
+}
+
+test "corrupt buffers error instead of reading out of bounds" {
+    // A valid buffer holding every shape the probe reads.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const name = try b.createString("probe");
+    try b.startVector(4, 2, 4);
+    _ = try b.pushScalar(i32, 2);
+    _ = try b.pushScalar(i32, 1);
+    const vec = try b.endVector(2);
+    b.startTable();
+    const child = try b.endTable();
+    b.startTable();
+    try b.addScalar(i64, 0, 7, 0);
+    try b.addOffset(1, name);
+    try b.addOffset(2, vec);
+    try b.addOffset(3, child);
+    const root = try b.endTable();
+    const buf = try b.finish(root);
+
+    // Every truncation and every single-byte corruption must be survivable.
+    for (0..buf.len) |len| probeReads(buf[0..len]);
+    const copy = try testing.allocator.dupe(u8, buf);
+    defer testing.allocator.free(copy);
+    for (0..copy.len) |i| {
+        const original = copy[i];
+        copy[i] = 0xff;
+        probeReads(copy);
+        copy[i] = original;
+    }
 }
 
 test "builder leaks nothing on allocation failure" {

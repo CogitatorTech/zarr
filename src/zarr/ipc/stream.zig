@@ -140,11 +140,11 @@ pub const StreamReader = struct {
     pub fn init(allocator: Allocator, bytes: []const u8) DecodeError!StreamReader {
         const envelope = try message.decode(bytes);
         if (envelope.metadata.len == 0) return error.UnexpectedMessage;
-        const msg = flatbuffers.getRoot(envelope.metadata);
-        if (msg.readScalar(u8, message_slot_header_tag, 0) != header_schema) {
+        const msg = try flatbuffers.getRoot(envelope.metadata);
+        if (try msg.readScalar(u8, message_slot_header_tag, 0) != header_schema) {
             return error.UnexpectedMessage;
         }
-        const header = msg.readTable(message_slot_header) orelse return error.MalformedSchema;
+        const header = (try msg.readTable(message_slot_header)) orelse return error.MalformedSchema;
 
         var schema = try ipc_schema.readSchema(allocator, header);
         errdefer schema.deinit(allocator);
@@ -176,8 +176,8 @@ pub const StreamReader = struct {
             return null;
         }
 
-        const msg = flatbuffers.getRoot(envelope.metadata);
-        const body_length = msg.readScalar(i64, message_slot_body_length, 0);
+        const msg = try flatbuffers.getRoot(envelope.metadata);
+        const body_length = try msg.readScalar(i64, message_slot_body_length, 0);
         if (body_length < 0) return error.Truncated;
         const body_len: usize = @intCast(body_length);
         if (envelope.body.len < body_len) return error.Truncated;
@@ -196,19 +196,19 @@ pub const StreamReader = struct {
 pub fn decodeBatchMessage(allocator: Allocator, bytes: []const u8, column_type: DataType) DecodeError!ArrayData {
     const envelope = try message.decode(bytes);
     if (envelope.metadata.len == 0) return error.UnexpectedMessage;
-    const msg = flatbuffers.getRoot(envelope.metadata);
+    const msg = try flatbuffers.getRoot(envelope.metadata);
 
-    const body_length = msg.readScalar(i64, message_slot_body_length, 0);
+    const body_length = try msg.readScalar(i64, message_slot_body_length, 0);
     if (body_length < 0) return error.Truncated;
     const body_len: usize = @intCast(body_length);
     if (envelope.body.len < body_len) return error.Truncated;
 
-    switch (msg.readScalar(u8, message_slot_header_tag, 0)) {
+    switch (try msg.readScalar(u8, message_slot_header_tag, 0)) {
         header_record_batch => {},
         header_schema => return error.UnexpectedMessage,
         else => return error.UnsupportedMessage,
     }
-    const header = msg.readTable(message_slot_header) orelse return error.MalformedBatch;
+    const header = (try msg.readTable(message_slot_header)) orelse return error.MalformedBatch;
     return batch.readRecordBatch(allocator, header, column_type, envelope.body[0..body_len]);
 }
 
@@ -440,6 +440,23 @@ test "reader walks a stream written by pyarrow" {
     try testing.expectEqual(@as(i64, 9), second.child(2).child(0).values(i64)[0]);
 
     try testing.expectEqual(@as(?ArrayData, null), try reader.next());
+}
+
+test "reader returns errors on corrupt stream bytes instead of crashing" {
+    const allocator = testing.allocator;
+    const copy = try allocator.dupe(u8, &pyarrow_stream);
+    defer allocator.free(copy);
+    for (0..copy.len) |i| {
+        const original = copy[i];
+        defer copy[i] = original;
+        copy[i] = 0xff;
+        var reader = StreamReader.init(allocator, copy) catch continue;
+        defer reader.deinit();
+        while (reader.next() catch null) |decoded| {
+            var data = decoded;
+            data.deinit();
+        }
+    }
 }
 
 test "stream serialization leaks nothing on allocation failure" {

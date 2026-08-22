@@ -29,7 +29,7 @@ pub const DecodeError = error{
     UnsupportedEndianness,
     /// The buffer does not describe a well-formed schema.
     MalformedSchema,
-} || Allocator.Error;
+} || flatbuffers.ReadError || Allocator.Error;
 
 // Members of the `Type` union in Schema.fbs, in declaration order.
 // FlatBuffers numbers union members from 1; 0 means absent. Members Zarr does
@@ -204,11 +204,11 @@ pub fn encode(allocator: Allocator, schema: Schema) Allocator.Error![]u8 {
 /// errors.
 pub fn readSchema(allocator: Allocator, table: Table) DecodeError!Schema {
     // Endianness: Little 0 (the default), Big 1.
-    if (table.readScalar(i16, schema_slot_endianness, 0) != 0) {
+    if (try table.readScalar(i16, schema_slot_endianness, 0) != 0) {
         return error.UnsupportedEndianness;
     }
 
-    const n = table.vectorLen(schema_slot_fields);
+    const n = try table.vectorLen(schema_slot_fields);
     const fields = try allocator.alloc(Field, n);
     var finished: usize = 0;
     errdefer {
@@ -216,7 +216,7 @@ pub fn readSchema(allocator: Allocator, table: Table) DecodeError!Schema {
         allocator.free(fields);
     }
     for (0..n) |i| {
-        fields[i] = try readField(allocator, table.vectorTable(schema_slot_fields, i));
+        fields[i] = try readField(allocator, try table.vectorTable(schema_slot_fields, i));
         finished += 1;
     }
     return .{ .fields = fields };
@@ -225,21 +225,27 @@ pub fn readSchema(allocator: Allocator, table: Table) DecodeError!Schema {
 /// Reads one `Field` table into an owned `Field`. A field with no name gets
 /// an empty one, since `Field.name` is not optional.
 fn readField(allocator: Allocator, table: Table) DecodeError!Field {
-    var data_type = try readType(allocator, table);
+    var data_type = try readType(allocator, table, 0);
     errdefer data_type.deinit(allocator);
-    const name = try allocator.dupe(u8, table.readString(field_slot_name) orelse "");
-    return .{
-        .name = name,
-        .data_type = data_type,
-        .nullable = table.readScalar(bool, field_slot_nullable, false),
-    };
+    // All fallible reads happen before the name is duped, so nothing leaks
+    // when one of them fails.
+    const nullable = try table.readScalar(bool, field_slot_nullable, false);
+    const raw_name = (try table.readString(field_slot_name)) orelse "";
+    const name = try allocator.dupe(u8, raw_name);
+    return .{ .name = name, .data_type = data_type, .nullable = nullable };
 }
+
+/// Nesting bound for `readType`. A hostile buffer can point a field's child
+/// at the field itself, which would recurse forever; real schemas stay far
+/// below this depth.
+const max_type_nesting = 64;
 
 /// Reads the `Type` union of a `Field` table, recursing into the field's
 /// children for list and struct. The nested type's `Type` members carry no
 /// child information themselves; children live on the enclosing field.
-fn readType(allocator: Allocator, field_table: Table) DecodeError!DataType {
-    switch (field_table.readScalar(u8, field_slot_type_tag, 0)) {
+fn readType(allocator: Allocator, field_table: Table, depth: usize) DecodeError!DataType {
+    if (depth > max_type_nesting) return error.MalformedSchema;
+    switch (try field_table.readScalar(u8, field_slot_type_tag, 0)) {
         type_null => return .null,
         type_bool => return .boolean,
         type_binary => return .binary,
@@ -247,9 +253,9 @@ fn readType(allocator: Allocator, field_table: Table) DecodeError!DataType {
         type_large_binary => return .large_binary,
         type_large_utf8 => return .large_utf8,
         type_int => {
-            const t = field_table.readTable(field_slot_type) orelse return error.MalformedSchema;
-            const bits = t.readScalar(i32, 0, 0);
-            if (t.readScalar(bool, 1, false)) {
+            const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
+            const bits = try t.readScalar(i32, 0, 0);
+            if (try t.readScalar(bool, 1, false)) {
                 return switch (bits) {
                     8 => .int8,
                     16 => .int16,
@@ -267,8 +273,8 @@ fn readType(allocator: Allocator, field_table: Table) DecodeError!DataType {
             };
         },
         type_floating_point => {
-            const t = field_table.readTable(field_slot_type) orelse return error.MalformedSchema;
-            return switch (t.readScalar(i16, 0, 0)) {
+            const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
+            return switch (try t.readScalar(i16, 0, 0)) {
                 0 => .float16,
                 1 => .float32,
                 2 => .float64,
@@ -276,33 +282,33 @@ fn readType(allocator: Allocator, field_table: Table) DecodeError!DataType {
             };
         },
         type_date => {
-            const t = field_table.readTable(field_slot_type) orelse return error.MalformedSchema;
-            return switch (t.readScalar(i16, 0, 1)) {
+            const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
+            return switch (try t.readScalar(i16, 0, 1)) {
                 0 => .date32,
                 1 => .date64,
                 else => error.UnsupportedType,
             };
         },
         type_timestamp => {
-            const t = field_table.readTable(field_slot_type) orelse return error.MalformedSchema;
+            const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
             // Zarr's timestamp has no timezone, so a zoned timestamp cannot be
             // represented; dropping the zone would change the data's meaning.
-            if (t.readString(1)) |tz| {
+            if (try t.readString(1)) |tz| {
                 if (tz.len != 0) return error.UnsupportedType;
             }
-            const unit = t.readScalar(i16, 0, 0);
+            const unit = try t.readScalar(i16, 0, 0);
             if (unit < 0 or unit > 3) return error.UnsupportedType;
             return .{ .timestamp = @enumFromInt(unit) };
         },
         type_list => {
-            if (field_table.vectorLen(field_slot_children) != 1) return error.MalformedSchema;
+            if (try field_table.vectorLen(field_slot_children) != 1) return error.MalformedSchema;
             const child = try allocator.create(DataType);
             errdefer allocator.destroy(child);
-            child.* = try readType(allocator, field_table.vectorTable(field_slot_children, 0));
+            child.* = try readType(allocator, try field_table.vectorTable(field_slot_children, 0), depth + 1);
             return .{ .list = child };
         },
         type_struct => {
-            const n = field_table.vectorLen(field_slot_children);
+            const n = try field_table.vectorLen(field_slot_children);
             const children = try allocator.alloc(DataType, n);
             var finished: usize = 0;
             errdefer {
@@ -310,7 +316,7 @@ fn readType(allocator: Allocator, field_table: Table) DecodeError!DataType {
                 allocator.free(children);
             }
             for (0..n) |i| {
-                children[i] = try readType(allocator, field_table.vectorTable(field_slot_children, i));
+                children[i] = try readType(allocator, try field_table.vectorTable(field_slot_children, i), depth + 1);
                 finished += 1;
             }
             return .{ .@"struct" = children };
@@ -322,7 +328,7 @@ fn readType(allocator: Allocator, field_table: Table) DecodeError!DataType {
 /// Decodes a standalone buffer produced by `encode`. The caller owns the
 /// returned schema and must release it with `deinit`.
 pub fn decode(allocator: Allocator, buf: []const u8) DecodeError!Schema {
-    return readSchema(allocator, flatbuffers.getRoot(buf));
+    return readSchema(allocator, try flatbuffers.getRoot(buf));
 }
 
 const testing = std.testing;
@@ -455,9 +461,9 @@ test "decode reads a schema serialized by pyarrow" {
 
     // Message table slots (Message.fbs): 0 version, 1 header tag, 2 header,
     // 3 body length, 4 custom metadata. Header tag 1 is Schema.
-    const message = flatbuffers.getRoot(metadata);
-    try testing.expectEqual(@as(u8, 1), message.readScalar(u8, 1, 0));
-    const schema_table = message.readTable(2).?;
+    const message = try flatbuffers.getRoot(metadata);
+    try testing.expectEqual(@as(u8, 1), try message.readScalar(u8, 1, 0));
+    const schema_table = (try message.readTable(2)).?;
 
     var schema = try readSchema(testing.allocator, schema_table);
     defer schema.deinit(testing.allocator);
@@ -551,6 +557,30 @@ test "decode rejects a type Zarr does not implement" {
     const buf = try b.finish(root);
 
     try testing.expectError(error.UnsupportedType, decode(testing.allocator, buf));
+}
+
+test "decode returns errors on corrupt metadata instead of crashing" {
+    const allocator = testing.allocator;
+    const metadata_len = std.mem.readInt(u32, pyarrow_schema_message[4..8], .little);
+    const metadata = pyarrow_schema_message[8 .. 8 + metadata_len];
+
+    // Every truncation must decode cleanly or return an error, never read
+    // out of bounds.
+    for (0..metadata.len) |len| {
+        var schema = decode(allocator, metadata[0..len]) catch continue;
+        schema.deinit(allocator);
+    }
+
+    // Likewise for every single-byte corruption.
+    const copy = try allocator.dupe(u8, metadata);
+    defer allocator.free(copy);
+    for (0..copy.len) |i| {
+        const original = copy[i];
+        defer copy[i] = original;
+        copy[i] = 0xff;
+        var schema = decode(allocator, copy) catch continue;
+        schema.deinit(allocator);
+    }
 }
 
 test "encode and decode leak nothing on allocation failure" {

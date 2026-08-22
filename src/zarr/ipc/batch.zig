@@ -34,7 +34,7 @@ pub const DecodeError = error{
     /// node or buffer counts disagree with the type, a count is negative, or
     /// a buffer runs past the end of the body.
     MalformedBatch,
-} || Allocator.Error;
+} || ArrayData.Error || flatbuffers.ReadError || Allocator.Error;
 
 // `RecordBatch` table slots in Message.fbs: 0 length, 1 nodes, 2 buffers,
 // 3 compression, 4 variadic buffer counts.
@@ -197,9 +197,9 @@ fn countBuffers(data_type: DataType) usize {
 /// owns the returned data and must release it with `deinit`.
 pub fn readRecordBatch(allocator: Allocator, table: Table, data_type: DataType, body: []const u8) DecodeError!ArrayData {
     std.debug.assert(data_type == .@"struct");
-    if (table.readTable(batch_slot_compression) != null) return error.UnsupportedCompression;
+    if (try table.readTable(batch_slot_compression) != null) return error.UnsupportedCompression;
 
-    const length = table.readScalar(i64, batch_slot_length, 0);
+    const length = try table.readScalar(i64, batch_slot_length, 0);
     if (length < 0) return error.MalformedBatch;
 
     const column_types = data_type.@"struct";
@@ -209,32 +209,45 @@ pub fn readRecordBatch(allocator: Allocator, table: Table, data_type: DataType, 
         expected_nodes += countNodes(column_type);
         expected_buffers += countBuffers(column_type);
     }
-    if (table.vectorLen(batch_slot_nodes) != expected_nodes) return error.MalformedBatch;
-    if (table.vectorLen(batch_slot_buffers) != expected_buffers) return error.MalformedBatch;
+    if (try table.vectorLen(batch_slot_nodes) != expected_nodes) return error.MalformedBatch;
+    if (try table.vectorLen(batch_slot_buffers) != expected_buffers) return error.MalformedBatch;
 
-    var node_i: usize = 0;
-    var buffer_i: usize = 0;
-    const children = try allocator.alloc(ArrayData, column_types.len);
-    var finished: usize = 0;
-    errdefer {
-        for (children[0..finished]) |*child| child.deinit();
-        allocator.free(children);
-    }
-    for (column_types, 0..) |column_type, i| {
-        children[i] = try readColumn(allocator, table, column_type, body, &node_i, &buffer_i);
-        finished += 1;
-    }
+    // Constructed inside a block so its errdefers end with the block: once
+    // `result` owns everything, the failure path below must free through
+    // `result.deinit` alone.
+    var result = blk: {
+        var node_i: usize = 0;
+        var buffer_i: usize = 0;
+        const children = try allocator.alloc(ArrayData, column_types.len);
+        var finished: usize = 0;
+        errdefer {
+            for (children[0..finished]) |*child| child.deinit();
+            allocator.free(children);
+        }
+        for (column_types, 0..) |column_type, i| {
+            children[i] = try readColumn(allocator, table, column_type, body, &node_i, &buffer_i);
+            finished += 1;
+        }
 
-    // The root is the batch's struct array; its validity slot is empty and its
-    // rows are never null.
-    const root_buffers = try allocator.alloc(?Buffer, 1);
-    errdefer allocator.free(root_buffers);
-    root_buffers[0] = null;
-    const root_type = try data_type.clone(allocator);
-    // The layout is correct by construction, so init cannot fail: the buffer
-    // and child counts match the type, the children were built from the same
-    // type, and the root null count is zero.
-    return ArrayData.init(allocator, root_type, @intCast(length), 0, root_buffers, children) catch unreachable;
+        // The root is the batch's struct array; its validity slot is empty
+        // and its rows are never null.
+        const root_buffers = try allocator.alloc(?Buffer, 1);
+        errdefer allocator.free(root_buffers);
+        root_buffers[0] = null;
+        const root_type = try data_type.clone(allocator);
+        // The layout is correct by construction, so init cannot fail: the
+        // buffer and child counts match the type, the children were built
+        // from the same type, and the root null count is zero.
+        break :blk ArrayData.init(allocator, root_type, @intCast(length), 0, root_buffers, children) catch unreachable;
+    };
+    // The metadata and body were only checked structurally so far. Offsets,
+    // null counts, and buffer sizes come from untrusted bytes, so validate
+    // the decoded arrays in full before handing them out.
+    result.validateFull() catch |err| {
+        result.deinit();
+        return err;
+    };
+    return result;
 }
 
 /// Reads one column: its `FieldNode`, its buffers, and its children,
@@ -247,10 +260,10 @@ fn readColumn(
     node_i: *usize,
     buffer_i: *usize,
 ) DecodeError!ArrayData {
-    const node_pos = table.vectorStructPos(batch_slot_nodes, node_i.*, struct_size);
+    const node_pos = try table.vectorStructPos(batch_slot_nodes, node_i.*, struct_size);
     node_i.* += 1;
-    const length = table.scalarAt(i64, node_pos);
-    const null_count = table.scalarAt(i64, node_pos + 8);
+    const length = try table.scalarAt(i64, node_pos);
+    const null_count = try table.scalarAt(i64, node_pos + 8);
     if (length < 0 or null_count < 0 or null_count > length) return error.MalformedBatch;
 
     const buffer_count = ArrayData.bufferCount(data_type);
@@ -299,10 +312,10 @@ fn readColumn(
 /// Reads the next `Buffer` entry and returns its bytes within `body`, checking
 /// that the entry lies inside the body.
 fn bodySegment(table: Table, body: []const u8, buffer_i: *usize) DecodeError![]const u8 {
-    const pos = table.vectorStructPos(batch_slot_buffers, buffer_i.*, struct_size);
+    const pos = try table.vectorStructPos(batch_slot_buffers, buffer_i.*, struct_size);
     buffer_i.* += 1;
-    const offset = table.scalarAt(i64, pos);
-    const length = table.scalarAt(i64, pos + 8);
+    const offset = try table.scalarAt(i64, pos);
+    const length = try table.scalarAt(i64, pos + 8);
     if (offset < 0 or length < 0) return error.MalformedBatch;
     const start: u64 = @intCast(offset);
     const len: u64 = @intCast(length);
@@ -353,7 +366,7 @@ test "record batch columns round-trip through metadata and body" {
 
     var struct_type = try DataType.initStruct(allocator, &.{ .int32, .utf8 });
     defer struct_type.deinit(allocator);
-    var back = try readRecordBatch(allocator, flatbuffers.getRoot(metadata), struct_type, body);
+    var back = try readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body);
     defer back.deinit();
 
     try testing.expectEqual(@as(usize, 3), back.length);
@@ -400,7 +413,7 @@ test "list column round-trips" {
     var struct_type = try DataType.initStruct(allocator, &.{list_type});
     list_type.deinit(allocator);
     defer struct_type.deinit(allocator);
-    var back = try readRecordBatch(allocator, flatbuffers.getRoot(metadata), struct_type, body);
+    var back = try readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body);
     defer back.deinit();
 
     const tags = back.child(0);
@@ -432,7 +445,7 @@ test "zero-row batch round-trips" {
 
     var struct_type = try DataType.initStruct(allocator, &.{ .int32, .utf8 });
     defer struct_type.deinit(allocator);
-    var back = try readRecordBatch(allocator, flatbuffers.getRoot(metadata), struct_type, body);
+    var back = try readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body);
     defer back.deinit();
 
     try testing.expectEqual(@as(usize, 0), back.length);
@@ -480,10 +493,10 @@ test "readRecordBatch reads a batch serialized by pyarrow" {
 
     // Message table slots (Message.fbs): 0 version, 1 header tag, 2 header,
     // 3 body length. Header tag 3 is RecordBatch.
-    const message = flatbuffers.getRoot(metadata);
-    try testing.expectEqual(@as(u8, 3), message.readScalar(u8, 1, 0));
-    try testing.expectEqual(@as(i64, @intCast(body.len)), message.readScalar(i64, 3, 0));
-    const batch_table = message.readTable(2).?;
+    const message = try flatbuffers.getRoot(metadata);
+    try testing.expectEqual(@as(u8, 3), try message.readScalar(u8, 1, 0));
+    try testing.expectEqual(@as(i64, @intCast(body.len)), try message.readScalar(i64, 3, 0));
+    const batch_table = (try message.readTable(2)).?;
 
     var list_type = try DataType.initList(allocator, .int64);
     var struct_type = try DataType.initStruct(allocator, &.{ .int32, .utf8, list_type });
@@ -533,7 +546,7 @@ test "readRecordBatch rejects a compressed body" {
     defer struct_type.deinit(allocator);
     try testing.expectError(
         error.UnsupportedCompression,
-        readRecordBatch(allocator, flatbuffers.getRoot(buf), struct_type, &.{}),
+        readRecordBatch(allocator, try flatbuffers.getRoot(buf), struct_type, &.{}),
     );
 }
 
@@ -551,7 +564,7 @@ test "readRecordBatch rejects a body too short for its buffers" {
     defer struct_type.deinit(allocator);
     try testing.expectError(
         error.MalformedBatch,
-        readRecordBatch(allocator, flatbuffers.getRoot(metadata), struct_type, &.{}),
+        readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, &.{}),
     );
 }
 
@@ -572,7 +585,46 @@ test "readRecordBatch rejects metadata that disagrees with the type" {
     defer struct_type.deinit(allocator);
     try testing.expectError(
         error.MalformedBatch,
-        readRecordBatch(allocator, flatbuffers.getRoot(metadata), struct_type, body),
+        readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body),
+    );
+}
+
+test "readRecordBatch rejects a batch with corrupt offsets" {
+    const allocator = testing.allocator;
+    // A utf8 column with decreasing offsets, wrapped as a batch by hand. The
+    // writer does not validate, so the reader must.
+    var offsets = try Buffer.alloc(allocator, 3 * @sizeOf(i32));
+    const off = offsets.items(i32);
+    off[0] = 0;
+    off[1] = 5;
+    off[2] = 3;
+    const values = try Buffer.dupe(allocator, "abcdefgh");
+    const column_buffers = try allocator.alloc(?Buffer, 3);
+    column_buffers[0] = null;
+    column_buffers[1] = offsets;
+    column_buffers[2] = values;
+    const column = try ArrayData.init(allocator, .utf8, 2, 0, column_buffers, try allocator.alloc(ArrayData, 0));
+
+    const struct_type = try DataType.initStruct(allocator, &.{.utf8});
+    const root_buffers = try allocator.alloc(?Buffer, 1);
+    root_buffers[0] = null;
+    const root_children = try allocator.alloc(ArrayData, 1);
+    root_children[0] = column;
+    var data = try ArrayData.init(allocator, struct_type, 2, 0, root_buffers, root_children);
+    defer data.deinit();
+
+    var b = Builder.init(allocator);
+    defer b.deinit();
+    const root = try writeRecordBatch(&b, data);
+    const metadata = try b.finish(root);
+    const body = try encodeBody(allocator, data);
+    defer allocator.free(body);
+
+    var expected_type = try DataType.initStruct(allocator, &.{.utf8});
+    defer expected_type.deinit(allocator);
+    try testing.expectError(
+        error.InvalidOffset,
+        readRecordBatch(allocator, try flatbuffers.getRoot(metadata), expected_type, body),
     );
 }
 
@@ -589,7 +641,7 @@ test "record batch serialization leaks nothing on allocation failure" {
             defer allocator.free(body);
             var struct_type = try DataType.initStruct(allocator, &.{ .int32, .utf8 });
             defer struct_type.deinit(allocator);
-            var back = try readRecordBatch(allocator, flatbuffers.getRoot(metadata), struct_type, body);
+            var back = try readRecordBatch(allocator, try flatbuffers.getRoot(metadata), struct_type, body);
             back.deinit();
         }
     };

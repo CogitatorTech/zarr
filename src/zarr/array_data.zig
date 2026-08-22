@@ -21,12 +21,20 @@ const DataType = @import("datatype.zig").DataType;
 pub const ArrayData = struct {
     const Self = @This();
 
-    /// Error set for `init` and `validate`.
+    /// Error set for `init`, `validate`, and `validateFull`.
     pub const Error = error{
         BufferCountMismatch,
         ChildCountMismatch,
         InvalidNullCount,
         ChildTypeMismatch,
+        /// A buffer is too small for the declared length.
+        BufferTooSmall,
+        /// An offset is negative, decreasing, or points past its target.
+        InvalidOffset,
+        /// A utf8 array holds bytes that are not valid UTF-8.
+        InvalidUtf8,
+        /// A nested child is shorter than its parent requires.
+        ChildLengthMismatch,
     };
 
     /// Allocator that owns the type, buffers, children, and their slices.
@@ -176,6 +184,97 @@ pub const ArrayData = struct {
             },
             else => {},
         }
+    }
+
+    /// Deep validation for data from untrusted sources, such as IPC bytes.
+    /// On top of `validate`, checks that every buffer is large enough for the
+    /// declared length, that the null count matches the validity bitmap, that
+    /// offsets start at or above zero, never decrease, and end within their
+    /// target, that utf8 values are valid UTF-8, and that nested children are
+    /// long enough. Costs O(length), so builders skip it; decoders run it.
+    pub fn validateFull(self: Self) Error!void {
+        try self.validate();
+
+        if (self.data_type == .null) {
+            // A null array is entirely null and carries no buffers.
+            if (self.null_count != self.length) return error.InvalidNullCount;
+        } else if (self.validity()) |bitmap| {
+            if (bitmap.data.len < (self.length + 7) / 8) return error.BufferTooSmall;
+            const set_bits = countSetBits(bitmap.data, self.length);
+            if (self.length - set_bits != self.null_count) return error.InvalidNullCount;
+        } else if (self.null_count != 0) {
+            return error.InvalidNullCount;
+        }
+
+        switch (self.data_type) {
+            .null => {},
+            .binary => try self.validateVariable(i32, false),
+            .utf8 => try self.validateVariable(i32, true),
+            .large_binary => try self.validateVariable(i64, false),
+            .large_utf8 => try self.validateVariable(i64, true),
+            .list => _ = try self.checkedOffsets(i32, self.children[0].length),
+            .@"struct" => for (self.children) |nested| {
+                if (nested.length < self.length) return error.ChildLengthMismatch;
+            },
+            else => {
+                const bits = self.data_type.bitWidth().?;
+                const value_buffer = self.buffers[1] orelse return error.BufferTooSmall;
+                if (bits == 1) {
+                    if (value_buffer.data.len < (self.length + 7) / 8) return error.BufferTooSmall;
+                } else if (self.length > value_buffer.data.len / (bits / 8)) {
+                    // Compared by division so a huge declared length cannot
+                    // overflow a multiplication.
+                    return error.BufferTooSmall;
+                }
+            },
+        }
+
+        for (self.children) |nested| try nested.validateFull();
+    }
+
+    /// Set bits among the first `length` bits of `bitmap`, which the caller
+    /// has checked is long enough.
+    fn countSetBits(bitmap: []const u8, length: usize) usize {
+        var count: usize = 0;
+        for (bitmap[0 .. length / 8]) |byte| count += @popCount(byte);
+        const rem: u3 = @intCast(length % 8);
+        if (rem != 0) {
+            const mask = (@as(u8, 1) << rem) - 1;
+            count += @popCount(bitmap[length / 8] & mask);
+        }
+        return count;
+    }
+
+    /// Checks a variable-length binary layout: offsets against the values
+    /// buffer, and optionally that every valid element is UTF-8.
+    fn validateVariable(self: Self, comptime OffsetInt: type, check_utf8: bool) Error!void {
+        const value_buffer = self.buffers[2] orelse return error.BufferTooSmall;
+        const offs = (try self.checkedOffsets(OffsetInt, value_buffer.data.len)) orelse return;
+        if (!check_utf8) return;
+        for (0..self.length) |i| {
+            if (!self.isValid(i)) continue;
+            const bytes = value_buffer.data[@intCast(offs[i])..@intCast(offs[i + 1])];
+            if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
+        }
+    }
+
+    /// Shared offset checks for variable-length and list layouts: enough
+    /// entries, a non-negative start, monotonicity, and an end within
+    /// `limit`. Returns null for a zero-length array with an empty offsets
+    /// buffer, which other implementations write.
+    fn checkedOffsets(self: Self, comptime OffsetInt: type, limit: usize) Error!?[]const OffsetInt {
+        const offsets_buffer = self.buffers[1] orelse return error.BufferTooSmall;
+        if (self.length == 0 and offsets_buffer.data.len == 0) return null;
+        if (offsets_buffer.data.len / @sizeOf(OffsetInt) < self.length + 1) return error.BufferTooSmall;
+        const offs = offsets_buffer.items(OffsetInt)[0 .. self.length + 1];
+        if (offs[0] < 0) return error.InvalidOffset;
+        var prev = offs[0];
+        for (offs[1..]) |o| {
+            if (o < prev) return error.InvalidOffset;
+            prev = o;
+        }
+        if (@as(u64, @intCast(offs[self.length])) > limit) return error.InvalidOffset;
+        return offs;
     }
 };
 
@@ -396,4 +495,178 @@ test "array data leaks nothing on allocation failure" {
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Case.run, .{});
+}
+
+test "validateFull accepts well-formed arrays" {
+    const allocator = testing.allocator;
+    // utf8 "hi", "" with a null in the middle.
+    var validity = try Buffer.allocZeroed(allocator, 1);
+    validity.data[0] = 0b101;
+    var offsets = try Buffer.alloc(allocator, 4 * @sizeOf(i32));
+    const off = offsets.items(i32);
+    off[0] = 0;
+    off[1] = 2;
+    off[2] = 2;
+    off[3] = 2;
+    const values = try Buffer.dupe(allocator, "hi");
+    var data = try ArrayData.init(allocator, .utf8, 3, 1, try buffersOf(allocator, &.{ validity, offsets, values }), try childrenOf(allocator, &.{}));
+    defer data.deinit();
+    try data.validateFull();
+}
+
+test "validateFull rejects a values buffer too small for the length" {
+    const allocator = testing.allocator;
+    const values = try Buffer.alloc(allocator, 4); // one i32, three declared
+    var data = try ArrayData.init(allocator, .int32, 3, 0, try buffersOf(allocator, &.{ null, values }), try childrenOf(allocator, &.{}));
+    defer data.deinit();
+    try testing.expectError(error.BufferTooSmall, data.validateFull());
+}
+
+test "validateFull rejects a validity buffer too small for the length" {
+    const allocator = testing.allocator;
+    var validity = try Buffer.allocZeroed(allocator, 1); // 9 elements need 2 bytes
+    validity.data[0] = 0xff;
+    const values = try Buffer.alloc(allocator, 9 * @sizeOf(i32));
+    var data = try ArrayData.init(allocator, .int32, 9, 1, try buffersOf(allocator, &.{ validity, values }), try childrenOf(allocator, &.{}));
+    defer data.deinit();
+    try testing.expectError(error.BufferTooSmall, data.validateFull());
+}
+
+test "validateFull rejects a null count that disagrees with the bitmap" {
+    const allocator = testing.allocator;
+    var validity = try Buffer.allocZeroed(allocator, 1);
+    validity.data[0] = 0b101; // one null of three
+    const values = try Buffer.alloc(allocator, 3 * @sizeOf(i32));
+    var data = try ArrayData.init(allocator, .int32, 3, 2, try buffersOf(allocator, &.{ validity, values }), try childrenOf(allocator, &.{}));
+    defer data.deinit();
+    try testing.expectError(error.InvalidNullCount, data.validateFull());
+}
+
+test "validateFull rejects nulls without a validity buffer" {
+    const allocator = testing.allocator;
+    const values = try Buffer.alloc(allocator, 3 * @sizeOf(i32));
+    var data = try ArrayData.init(allocator, .int32, 3, 1, try buffersOf(allocator, &.{ null, values }), try childrenOf(allocator, &.{}));
+    defer data.deinit();
+    try testing.expectError(error.InvalidNullCount, data.validateFull());
+}
+
+test "validateFull requires a null array to be entirely null" {
+    const allocator = testing.allocator;
+    var data = try ArrayData.init(allocator, .null, 3, 2, try buffersOf(allocator, &.{}), try childrenOf(allocator, &.{}));
+    defer data.deinit();
+    try testing.expectError(error.InvalidNullCount, data.validateFull());
+}
+
+fn utf8WithOffsets(allocator: Allocator, offset_values: []const i32, values: []const u8) !ArrayData {
+    var offsets = try Buffer.alloc(allocator, offset_values.len * @sizeOf(i32));
+    @memcpy(offsets.items(i32)[0..offset_values.len], offset_values);
+    const value_buffer = try Buffer.dupe(allocator, values);
+    return ArrayData.init(
+        allocator,
+        .utf8,
+        offset_values.len - 1,
+        0,
+        try buffersOf(allocator, &.{ null, offsets, value_buffer }),
+        try childrenOf(allocator, &.{}),
+    );
+}
+
+test "validateFull rejects decreasing offsets" {
+    var data = try utf8WithOffsets(testing.allocator, &.{ 0, 5, 3 }, "abcdefgh");
+    defer data.deinit();
+    try testing.expectError(error.InvalidOffset, data.validateFull());
+}
+
+test "validateFull rejects a negative first offset" {
+    var data = try utf8WithOffsets(testing.allocator, &.{ -1, 0, 2 }, "abcdefgh");
+    defer data.deinit();
+    try testing.expectError(error.InvalidOffset, data.validateFull());
+}
+
+test "validateFull rejects an offset past the values buffer" {
+    var data = try utf8WithOffsets(testing.allocator, &.{ 0, 4, 10 }, "abcdefgh");
+    defer data.deinit();
+    try testing.expectError(error.InvalidOffset, data.validateFull());
+}
+
+test "validateFull rejects an offsets buffer with too few entries" {
+    const allocator = testing.allocator;
+    const offsets = try Buffer.allocZeroed(allocator, 2 * @sizeOf(i32)); // 2 elements need 3
+    const values = try Buffer.alloc(allocator, 4);
+    var data = try ArrayData.init(allocator, .utf8, 2, 0, try buffersOf(allocator, &.{ null, offsets, values }), try childrenOf(allocator, &.{}));
+    defer data.deinit();
+    try testing.expectError(error.BufferTooSmall, data.validateFull());
+}
+
+test "validateFull accepts an empty offsets buffer for a zero-length array" {
+    const allocator = testing.allocator;
+    const offsets = try Buffer.alloc(allocator, 0);
+    const values = try Buffer.alloc(allocator, 0);
+    var data = try ArrayData.init(allocator, .utf8, 0, 0, try buffersOf(allocator, &.{ null, offsets, values }), try childrenOf(allocator, &.{}));
+    defer data.deinit();
+    try data.validateFull();
+}
+
+test "validateFull rejects invalid UTF-8 in a utf8 array but not a binary array" {
+    const allocator = testing.allocator;
+    var utf8_data = try utf8WithOffsets(allocator, &.{ 0, 2 }, &.{ 0xff, 0xfe });
+    defer utf8_data.deinit();
+    try testing.expectError(error.InvalidUtf8, utf8_data.validateFull());
+
+    var offsets = try Buffer.alloc(allocator, 2 * @sizeOf(i32));
+    offsets.items(i32)[0] = 0;
+    offsets.items(i32)[1] = 2;
+    const values = try Buffer.dupe(allocator, &.{ 0xff, 0xfe });
+    var binary_data = try ArrayData.init(allocator, .binary, 1, 0, try buffersOf(allocator, &.{ null, offsets, values }), try childrenOf(allocator, &.{}));
+    defer binary_data.deinit();
+    try binary_data.validateFull();
+}
+
+test "validateFull skips null elements when checking UTF-8" {
+    const allocator = testing.allocator;
+    var validity = try Buffer.allocZeroed(allocator, 1);
+    validity.data[0] = 0b10; // element 0 null, element 1 valid
+    var offsets = try Buffer.alloc(allocator, 3 * @sizeOf(i32));
+    const off = offsets.items(i32);
+    off[0] = 0;
+    off[1] = 2;
+    off[2] = 3;
+    const values = try Buffer.dupe(allocator, &.{ 0xff, 0xfe, 'a' });
+    var data = try ArrayData.init(allocator, .utf8, 2, 1, try buffersOf(allocator, &.{ validity, offsets, values }), try childrenOf(allocator, &.{}));
+    defer data.deinit();
+    try data.validateFull();
+}
+
+test "validateFull rejects a list offset past the child length" {
+    const allocator = testing.allocator;
+    const child_values = try Buffer.alloc(allocator, 2 * @sizeOf(i32));
+    const child = try ArrayData.init(allocator, .int32, 2, 0, try buffersOf(allocator, &.{ null, child_values }), try childrenOf(allocator, &.{}));
+    var offsets = try Buffer.alloc(allocator, 2 * @sizeOf(i32));
+    offsets.items(i32)[0] = 0;
+    offsets.items(i32)[1] = 3; // child has 2 elements
+    const list_type = try DataType.initList(allocator, .int32);
+    var data = try ArrayData.init(allocator, list_type, 1, 0, try buffersOf(allocator, &.{ null, offsets }), try childrenOf(allocator, &.{child}));
+    defer data.deinit();
+    try testing.expectError(error.InvalidOffset, data.validateFull());
+}
+
+test "validateFull rejects a struct child shorter than the struct" {
+    const allocator = testing.allocator;
+    const child_values = try Buffer.alloc(allocator, @sizeOf(i32));
+    const child = try ArrayData.init(allocator, .int32, 1, 0, try buffersOf(allocator, &.{ null, child_values }), try childrenOf(allocator, &.{}));
+    const struct_type = try DataType.initStruct(allocator, &.{.int32});
+    var data = try ArrayData.init(allocator, struct_type, 2, 0, try buffersOf(allocator, &.{null}), try childrenOf(allocator, &.{child}));
+    defer data.deinit();
+    try testing.expectError(error.ChildLengthMismatch, data.validateFull());
+}
+
+test "validateFull recurses into children" {
+    const allocator = testing.allocator;
+    // A struct whose int32 child declares more elements than its buffer holds.
+    const child_values = try Buffer.alloc(allocator, @sizeOf(i32));
+    const child = try ArrayData.init(allocator, .int32, 2, 0, try buffersOf(allocator, &.{ null, child_values }), try childrenOf(allocator, &.{}));
+    const struct_type = try DataType.initStruct(allocator, &.{.int32});
+    var data = try ArrayData.init(allocator, struct_type, 2, 0, try buffersOf(allocator, &.{null}), try childrenOf(allocator, &.{child}));
+    defer data.deinit();
+    try testing.expectError(error.BufferTooSmall, data.validateFull());
 }
