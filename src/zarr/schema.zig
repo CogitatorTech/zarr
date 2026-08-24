@@ -1,53 +1,17 @@
 //! Schema and field metadata.
 //!
-//! A `Field` names a column and gives its logical type and nullability. A
-//! `Schema` is an ordered set of fields describing the columns of a record
-//! batch or table. Both own their heap memory: a field owns its name and its
-//! `DataType`, and a schema owns its fields. This mirrors the Arrow spec, where
-//! a schema is a list of named, typed, nullable fields.
+//! A `Field` names a column and gives its logical type and nullability; it
+//! is defined in `datatype.zig`, since nested types carry fields too, and is
+//! re-exported here. A `Schema` is an ordered set of fields describing the
+//! columns of a record batch or table, owning its fields. This mirrors the
+//! Arrow spec, where a schema is a list of named, typed, nullable fields.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const DataType = @import("datatype.zig").DataType;
 
-/// A named, typed, nullable column descriptor.
-pub const Field = struct {
-    /// Column name; owned by this field.
-    name: []const u8,
-    /// Logical type; owned by this field.
-    data_type: DataType,
-    /// Whether the column may contain nulls.
-    nullable: bool,
-
-    /// Builds a field owning a copy of `name` and a deep copy of `data_type`.
-    /// The caller retains ownership of both arguments and must release the
-    /// returned field with `deinit`.
-    pub fn init(allocator: Allocator, name: []const u8, data_type: DataType, nullable: bool) Allocator.Error!Field {
-        const owned_name = try allocator.dupe(u8, name);
-        errdefer allocator.free(owned_name);
-        const owned_type = try data_type.clone(allocator);
-        return .{ .name = owned_name, .data_type = owned_type, .nullable = nullable };
-    }
-
-    /// Frees the owned name and type.
-    pub fn deinit(self: *Field, allocator: Allocator) void {
-        allocator.free(self.name);
-        self.data_type.deinit(allocator);
-        self.* = undefined;
-    }
-
-    /// Deep-copies this field.
-    pub fn clone(self: Field, allocator: Allocator) Allocator.Error!Field {
-        return init(allocator, self.name, self.data_type, self.nullable);
-    }
-
-    /// Structural equality: name, type, and nullability all match.
-    pub fn equals(self: Field, other: Field) bool {
-        return self.nullable == other.nullable and
-            std.mem.eql(u8, self.name, other.name) and
-            self.data_type.equals(other.data_type);
-    }
-};
+/// A named, typed, nullable column descriptor, defined alongside `DataType`.
+pub const Field = @import("datatype.zig").Field;
 
 /// An ordered set of fields describing the columns of a record batch.
 pub const Schema = struct {
@@ -134,7 +98,7 @@ test "field owns a deep copy of a nested type" {
     list_type.deinit(std.testing.allocator);
 
     try std.testing.expect(f.data_type == .list);
-    try std.testing.expect(f.data_type.list.equals(.int32));
+    try std.testing.expect(f.data_type.list.data_type.equals(.int32));
     try std.testing.expect(f.nullable);
 }
 

@@ -33,9 +33,9 @@ pub const DecodeError = error{
 
 // Members of the `Type` union in Schema.fbs, in declaration order.
 // FlatBuffers numbers union members from 1; 0 means absent. Members Zarr does
-// not implement (Decimal 7, Time 9, Interval 11, Union 14, FixedSizeBinary 15,
-// FixedSizeList 16, Map 17, Duration 18, and the members past LargeList) have
-// no constant here and decode to `error.UnsupportedType`.
+// not implement (Interval 11, Union 14, Map 17, and the members past
+// LargeList) have no constant here and decode to `error.UnsupportedType`.
+const type_decimal: u8 = 7;
 const type_null: u8 = 1;
 const type_int: u8 = 2;
 const type_floating_point: u8 = 3;
@@ -43,8 +43,12 @@ const type_binary: u8 = 4;
 const type_utf8: u8 = 5;
 const type_bool: u8 = 6;
 const type_date: u8 = 8;
+const type_time: u8 = 9;
+const type_fixed_size_binary: u8 = 15;
+const type_fixed_size_list: u8 = 16;
 const type_timestamp: u8 = 10;
 const type_list: u8 = 12;
+const type_duration: u8 = 18;
 const type_struct: u8 = 13;
 const type_large_binary: u8 = 19;
 const type_large_utf8: u8 = 20;
@@ -55,6 +59,7 @@ const field_slot_name = 0;
 const field_slot_nullable = 1;
 const field_slot_type_tag = 2;
 const field_slot_type = 3;
+const field_slot_dictionary = 4;
 const field_slot_children = 5;
 
 // `Schema` table slots in Schema.fbs: 0 endianness, 1 fields,
@@ -86,38 +91,54 @@ pub fn writeSchema(b: *Builder, schema: Schema) Allocator.Error!Offset {
     return b.endTable();
 }
 
-/// Writes one `Field` table and returns its offset. A list's element child is
-/// conventionally named "item"; a struct's children have no names in a bare
-/// `DataType` and are written unnamed, matching the C Data Interface export.
-/// Child nullability is not part of `DataType` either, so children are written
-/// as nullable, which permits any child data.
+/// Writes one `Field` table and returns its offset. Child names and
+/// nullability come from the child fields nested types carry, so struct
+/// field names and list element names round-trip.
 fn writeField(b: *Builder, name: []const u8, data_type: DataType, nullable: bool) Allocator.Error!Offset {
+    // On the wire a dictionary-encoded field carries its VALUE type in the
+    // type union and its children, plus a DictionaryEncoding table naming the
+    // index type and dictionary id.
+    var dictionary_off: Offset = 0;
+    const wire_type = switch (data_type) {
+        .dictionary => |d| blk: {
+            dictionary_off = try writeDictionaryEncoding(b, d);
+            break :blk d.value.*;
+        },
+        else => data_type,
+    };
+
     var children_off: Offset = 0;
-    switch (data_type) {
+    switch (wire_type) {
         .list => |child| {
-            const item = try writeField(b, "item", child.*, true);
+            const item = try writeField(b, child.name, child.data_type, child.nullable);
             try b.startVector(4, 1, 4);
             try b.pushOffsetElement(item);
             children_off = try b.endVector(1);
         },
-        .@"struct" => |children| {
-            const offsets = try b.allocator.alloc(Offset, children.len);
+        .fixed_size_list => |fsl| {
+            const item = try writeField(b, fsl.child.name, fsl.child.data_type, fsl.child.nullable);
+            try b.startVector(4, 1, 4);
+            try b.pushOffsetElement(item);
+            children_off = try b.endVector(1);
+        },
+        .@"struct" => |fields| {
+            const offsets = try b.allocator.alloc(Offset, fields.len);
             defer b.allocator.free(offsets);
-            for (children, 0..) |child, i| {
-                offsets[i] = try writeField(b, "", child, true);
+            for (fields, 0..) |field, i| {
+                offsets[i] = try writeField(b, field.name, field.data_type, field.nullable);
             }
-            try b.startVector(4, children.len, 4);
-            var i = children.len;
+            try b.startVector(4, fields.len, 4);
+            var i = fields.len;
             while (i > 0) {
                 i -= 1;
                 try b.pushOffsetElement(offsets[i]);
             }
-            children_off = try b.endVector(children.len);
+            children_off = try b.endVector(fields.len);
         },
         else => {},
     }
 
-    const ty = try writeType(b, data_type);
+    const ty = try writeType(b, wire_type);
     const name_off = try b.createString(name);
 
     b.startTable();
@@ -125,7 +146,19 @@ fn writeField(b: *Builder, name: []const u8, data_type: DataType, nullable: bool
     try b.addScalar(bool, field_slot_nullable, nullable, false);
     try b.addScalar(u8, field_slot_type_tag, ty.tag, 0);
     try b.addOffset(field_slot_type, ty.offset);
+    try b.addOffset(field_slot_dictionary, dictionary_off);
     try b.addOffset(field_slot_children, children_off);
+    return b.endTable();
+}
+
+/// Writes a `DictionaryEncoding` table: id at slot 0, the index `Int` table
+/// at slot 1, and isOrdered at slot 2.
+fn writeDictionaryEncoding(b: *Builder, d: datatype.DictionaryType) Allocator.Error!Offset {
+    const index = try writeType(b, d.index.*);
+    b.startTable();
+    try b.addScalar(i64, 0, d.id, 0);
+    try b.addOffset(1, index.offset);
+    try b.addScalar(bool, 2, d.ordered, false);
     return b.endTable();
 }
 
@@ -156,12 +189,29 @@ fn writeType(b: *Builder, data_type: DataType) Allocator.Error!TypeOffset {
         // Date.unit: DAY 0, MILLISECOND 1 (the schema default).
         .date32 => writeScalarType(b, type_date, 0, 1),
         .date64 => writeScalarType(b, type_date, 1, 1),
-        // Timestamp.unit: SECOND 0 through NANOSECOND 3, matching the
-        // declaration order of `TimeUnit`. The timezone is omitted, since
-        // Zarr's timestamp carries none.
-        .timestamp => |unit| writeScalarType(b, type_timestamp, @intFromEnum(unit), 0),
+        .timestamp => |ts| writeTimestampType(b, ts),
+        .time32 => |unit| writeTimeType(b, unit, 32),
+        .time64 => |unit| writeTimeType(b, unit, 64),
+        // Duration.unit: the schema default is MILLISECOND (1).
+        .duration => |unit| writeScalarType(b, type_duration, @intFromEnum(unit), 1),
+        .decimal128 => |d| writeDecimalType(b, d, 128),
+        .decimal256 => |d| writeDecimalType(b, d, 256),
+        // FixedSizeBinary.byteWidth at slot 0.
+        .fixed_size_binary => |width| blk: {
+            b.startTable();
+            try b.addScalar(i32, 0, width, 0);
+            break :blk .{ .tag = type_fixed_size_binary, .offset = try b.endTable() };
+        },
+        // FixedSizeList.listSize at slot 0.
+        .fixed_size_list => |fsl| blk: {
+            b.startTable();
+            try b.addScalar(i32, 0, fsl.size, 0);
+            break :blk .{ .tag = type_fixed_size_list, .offset = try b.endTable() };
+        },
         .list => writeEmptyType(b, type_list),
         .@"struct" => writeEmptyType(b, type_struct),
+        // writeField unwraps dictionary fields to their value type.
+        .dictionary => unreachable,
     };
 }
 
@@ -177,6 +227,37 @@ fn writeScalarType(b: *Builder, tag: u8, value: i16, default: i16) Allocator.Err
     b.startTable();
     try b.addScalar(i16, 0, value, default);
     return .{ .tag = tag, .offset = try b.endTable() };
+}
+
+/// Writes a `Timestamp` type table: unit at slot 0 (SECOND 0 through
+/// NANOSECOND 3, the declaration order of `TimeUnit`), and the timezone
+/// string at slot 1 when the timestamp is zoned.
+fn writeTimestampType(b: *Builder, ts: datatype.TimestampType) Allocator.Error!TypeOffset {
+    var tz_off: Offset = 0;
+    if (ts.timezone) |tz| tz_off = try b.createString(tz);
+    b.startTable();
+    try b.addScalar(i16, 0, @intFromEnum(ts.unit), 0);
+    try b.addOffset(1, tz_off);
+    return .{ .tag = type_timestamp, .offset = try b.endTable() };
+}
+
+/// Writes a `Time` type table: unit at slot 0 (default MILLISECOND) and bit
+/// width at slot 1 (default 32).
+fn writeTimeType(b: *Builder, unit: datatype.TimeUnit, bits: i32) Allocator.Error!TypeOffset {
+    b.startTable();
+    try b.addScalar(i16, 0, @intFromEnum(unit), 1);
+    try b.addScalar(i32, 1, bits, 32);
+    return .{ .tag = type_time, .offset = try b.endTable() };
+}
+
+/// Writes a `Decimal` type table: precision at slot 0, scale at slot 1, and
+/// bit width at slot 2 (default 128).
+fn writeDecimalType(b: *Builder, d: datatype.DecimalParams, bits: i32) Allocator.Error!TypeOffset {
+    b.startTable();
+    try b.addScalar(i32, 0, d.precision, 0);
+    try b.addScalar(i32, 1, d.scale, 0);
+    try b.addScalar(i32, 2, bits, 128);
+    return .{ .tag = type_decimal, .offset = try b.endTable() };
 }
 
 /// Writes an `Int` type table: bit width at slot 0, signedness at slot 1.
@@ -216,17 +297,37 @@ pub fn readSchema(allocator: Allocator, table: Table) DecodeError!Schema {
         allocator.free(fields);
     }
     for (0..n) |i| {
-        fields[i] = try readField(allocator, try table.vectorTable(schema_slot_fields, i));
+        fields[i] = try readField(allocator, try table.vectorTable(schema_slot_fields, i), 0);
         finished += 1;
     }
     return .{ .fields = fields };
 }
 
-/// Reads one `Field` table into an owned `Field`. A field with no name gets
-/// an empty one, since `Field.name` is not optional.
-fn readField(allocator: Allocator, table: Table) DecodeError!Field {
-    var data_type = try readType(allocator, table, 0);
+/// Reads one `Field` table into an owned `Field`, recursing through `readType`
+/// into child fields. A field with no name gets an empty one, since
+/// `Field.name` is not optional. `depth` bounds the recursion; see
+/// `max_type_nesting`.
+fn readField(allocator: Allocator, table: Table, depth: usize) DecodeError!Field {
+    if (depth > max_type_nesting) return error.MalformedSchema;
+    var data_type = try readType(allocator, table, depth);
     errdefer data_type.deinit(allocator);
+
+    if (try table.readTable(field_slot_dictionary)) |encoding| {
+        // DictionaryEncoding slots: 0 id, 1 index Int table, 2 isOrdered,
+        // 3 dictionaryKind (only DenseArray, 0, exists).
+        const id = try encoding.readScalar(i64, 0, 0);
+        const ordered = try encoding.readScalar(bool, 2, false);
+        var index_type: DataType = .int32; // the spec default when absent
+        if (try encoding.readTable(1)) |index_table| {
+            const bits = try index_table.readScalar(i32, 0, 0);
+            const signed = try index_table.readScalar(bool, 1, false);
+            index_type = intTypeFor(bits, signed) orelse return error.MalformedSchema;
+        }
+        const wrapped = try DataType.initDictionary(allocator, id, index_type, data_type, ordered);
+        data_type.deinit(allocator);
+        data_type = wrapped;
+    }
+
     // All fallible reads happen before the name is duped, so nothing leaks
     // when one of them fails.
     const nullable = try table.readScalar(bool, field_slot_nullable, false);
@@ -235,16 +336,37 @@ fn readField(allocator: Allocator, table: Table) DecodeError!Field {
     return .{ .name = name, .data_type = data_type, .nullable = nullable };
 }
 
-/// Nesting bound for `readType`. A hostile buffer can point a field's child
+/// The integer type with the given width and signedness, or null when the
+/// combination is not an Arrow integer type.
+fn intTypeFor(bits: i32, signed: bool) ?DataType {
+    if (signed) {
+        return switch (bits) {
+            8 => .int8,
+            16 => .int16,
+            32 => .int32,
+            64 => .int64,
+            else => null,
+        };
+    }
+    return switch (bits) {
+        8 => .uint8,
+        16 => .uint16,
+        32 => .uint32,
+        64 => .uint64,
+        else => null,
+    };
+}
+
+/// Nesting bound for `readField`. A hostile buffer can point a field's child
 /// at the field itself, which would recurse forever; real schemas stay far
 /// below this depth.
 const max_type_nesting = 64;
 
 /// Reads the `Type` union of a `Field` table, recursing into the field's
 /// children for list and struct. The nested type's `Type` members carry no
-/// child information themselves; children live on the enclosing field.
+/// child information themselves; children live on the enclosing field and
+/// are read as full fields, keeping their names and nullability.
 fn readType(allocator: Allocator, field_table: Table, depth: usize) DecodeError!DataType {
-    if (depth > max_type_nesting) return error.MalformedSchema;
     switch (try field_table.readScalar(u8, field_slot_type_tag, 0)) {
         type_null => return .null,
         type_bool => return .boolean,
@@ -291,35 +413,84 @@ fn readType(allocator: Allocator, field_table: Table, depth: usize) DecodeError!
         },
         type_timestamp => {
             const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
-            // Zarr's timestamp has no timezone, so a zoned timestamp cannot be
-            // represented; dropping the zone would change the data's meaning.
-            if (try t.readString(1)) |tz| {
-                if (tz.len != 0) return error.UnsupportedType;
-            }
             const unit = try t.readScalar(i16, 0, 0);
             if (unit < 0 or unit > 3) return error.UnsupportedType;
-            return .{ .timestamp = @enumFromInt(unit) };
+            var timezone: ?[]const u8 = null;
+            if (try t.readString(1)) |tz| {
+                if (tz.len != 0) timezone = tz;
+            }
+            return DataType.initTimestamp(allocator, @enumFromInt(unit), timezone);
+        },
+        type_time => {
+            const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
+            const unit = try t.readScalar(i16, 0, 1);
+            const bits = try t.readScalar(i32, 1, 32);
+            // The spec pairs 32-bit times with second and millisecond units,
+            // and 64-bit times with microsecond and nanosecond units.
+            if (bits == 32 and unit == 0) return .{ .time32 = .second };
+            if (bits == 32 and unit == 1) return .{ .time32 = .millisecond };
+            if (bits == 64 and unit == 2) return .{ .time64 = .microsecond };
+            if (bits == 64 and unit == 3) return .{ .time64 = .nanosecond };
+            return error.MalformedSchema;
+        },
+        type_decimal => {
+            const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
+            const precision = try t.readScalar(i32, 0, 0);
+            const scale = try t.readScalar(i32, 1, 0);
+            const bits = try t.readScalar(i32, 2, 128);
+            if (precision < 1 or scale < -128 or scale > 127) return error.MalformedSchema;
+            const params = datatype.DecimalParams{
+                .precision = std.math.cast(u8, precision) orelse return error.MalformedSchema,
+                .scale = @intCast(scale),
+            };
+            // The spec caps precision at 38 digits for 128 bits and 76 for 256.
+            return switch (bits) {
+                128 => if (params.precision <= 38) .{ .decimal128 = params } else error.MalformedSchema,
+                256 => if (params.precision <= 76) .{ .decimal256 = params } else error.MalformedSchema,
+                else => error.UnsupportedType,
+            };
+        },
+        type_fixed_size_binary => {
+            const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
+            const width = try t.readScalar(i32, 0, 0);
+            if (width < 0) return error.MalformedSchema;
+            return .{ .fixed_size_binary = width };
+        },
+        type_fixed_size_list => {
+            const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
+            const size = try t.readScalar(i32, 0, 0);
+            if (size < 0) return error.MalformedSchema;
+            if (try field_table.vectorLen(field_slot_children) != 1) return error.MalformedSchema;
+            var child = try readField(allocator, try field_table.vectorTable(field_slot_children, 0), depth + 1);
+            defer child.deinit(allocator);
+            return DataType.initFixedSizeListField(allocator, child, size);
+        },
+        type_duration => {
+            const t = (try field_table.readTable(field_slot_type)) orelse return error.MalformedSchema;
+            const unit = try t.readScalar(i16, 0, 1);
+            if (unit < 0 or unit > 3) return error.UnsupportedType;
+            return .{ .duration = @enumFromInt(unit) };
         },
         type_list => {
             if (try field_table.vectorLen(field_slot_children) != 1) return error.MalformedSchema;
-            const child = try allocator.create(DataType);
+            const child = try allocator.create(Field);
             errdefer allocator.destroy(child);
-            child.* = try readType(allocator, try field_table.vectorTable(field_slot_children, 0), depth + 1);
+            child.* = try readField(allocator, try field_table.vectorTable(field_slot_children, 0), depth + 1);
             return .{ .list = child };
         },
         type_struct => {
             const n = try field_table.vectorLen(field_slot_children);
-            const children = try allocator.alloc(DataType, n);
+            const fields = try allocator.alloc(Field, n);
             var finished: usize = 0;
             errdefer {
-                for (children[0..finished]) |*c| c.deinit(allocator);
-                allocator.free(children);
+                for (fields[0..finished]) |*f| f.deinit(allocator);
+                allocator.free(fields);
             }
             for (0..n) |i| {
-                children[i] = try readType(allocator, try field_table.vectorTable(field_slot_children, i), depth + 1);
+                fields[i] = try readField(allocator, try field_table.vectorTable(field_slot_children, i), depth + 1);
                 finished += 1;
             }
-            return .{ .@"struct" = children };
+            return .{ .@"struct" = fields };
         },
         else => return error.UnsupportedType,
     }
@@ -353,18 +524,18 @@ test "flat schema round-trips through encode and decode" {
 
 test "every flat type round-trips" {
     const flat_types = [_]DataType{
-        .null,                          .boolean,
-        .int8,                          .int16,
-        .int32,                         .int64,
-        .uint8,                         .uint16,
-        .uint32,                        .uint64,
-        .float16,                       .float32,
-        .float64,                       .binary,
-        .utf8,                          .large_binary,
-        .large_utf8,                    .date32,
-        .date64,                        .{ .timestamp = .second },
-        .{ .timestamp = .millisecond }, .{ .timestamp = .microsecond },
-        .{ .timestamp = .nanosecond },
+        .null,                                       .boolean,
+        .int8,                                       .int16,
+        .int32,                                      .int64,
+        .uint8,                                      .uint16,
+        .uint32,                                     .uint64,
+        .float16,                                    .float32,
+        .float64,                                    .binary,
+        .utf8,                                       .large_binary,
+        .large_utf8,                                 .date32,
+        .date64,                                     .{ .timestamp = .{ .unit = .second } },
+        .{ .timestamp = .{ .unit = .millisecond } }, .{ .timestamp = .{ .unit = .microsecond } },
+        .{ .timestamp = .{ .unit = .nanosecond } },
     };
 
     var fields: [flat_types.len]Field = undefined;
@@ -410,6 +581,43 @@ test "nested list and struct types round-trip" {
     defer back.deinit(testing.allocator);
 
     try testing.expect(schema.equals(back));
+}
+
+test "named struct fields and list child fields round-trip" {
+    const allocator = testing.allocator;
+
+    var x = try Field.init(allocator, "x", .float64, false);
+    defer x.deinit(allocator);
+    var label = try Field.init(allocator, "label", .utf8, true);
+    defer label.deinit(allocator);
+    var point_type = try DataType.initStructFields(allocator, &.{ x, label });
+    defer point_type.deinit(allocator);
+
+    var element = try Field.init(allocator, "element", .int64, false);
+    defer element.deinit(allocator);
+    var readings_type = try DataType.initListField(allocator, element);
+    defer readings_type.deinit(allocator);
+
+    var point = try Field.init(allocator, "point", point_type, true);
+    defer point.deinit(allocator);
+    var readings = try Field.init(allocator, "readings", readings_type, false);
+    defer readings.deinit(allocator);
+    var schema = try Schema.init(allocator, &.{ point, readings });
+    defer schema.deinit(allocator);
+
+    const bytes = try encode(allocator, schema);
+    defer allocator.free(bytes);
+    var back = try decode(allocator, bytes);
+    defer back.deinit(allocator);
+
+    try testing.expect(schema.equals(back));
+    const point_back = back.field(0).data_type.@"struct";
+    try testing.expectEqualStrings("x", point_back[0].name);
+    try testing.expect(!point_back[0].nullable);
+    try testing.expectEqualStrings("label", point_back[1].name);
+    const element_back = back.field(1).data_type.list;
+    try testing.expectEqualStrings("element", element_back.name);
+    try testing.expect(!element_back.nullable);
 }
 
 test "empty schema round-trips" {
@@ -479,11 +687,11 @@ test "decode reads a schema serialized by pyarrow" {
     try testing.expect(schema.field(1).nullable);
 
     try testing.expectEqualStrings("ts", schema.field(2).name);
-    try testing.expect(schema.field(2).data_type.equals(.{ .timestamp = .microsecond }));
+    try testing.expect(schema.field(2).data_type.equals(.{ .timestamp = .{ .unit = .microsecond } }));
 
     try testing.expectEqualStrings("tags", schema.field(3).name);
     try testing.expect(schema.field(3).data_type == .list);
-    try testing.expect(schema.field(3).data_type.list.equals(.int64));
+    try testing.expect(schema.field(3).data_type.list.data_type.equals(.int64));
 }
 
 test "decode rejects a big-endian schema" {
@@ -500,22 +708,108 @@ test "decode rejects a big-endian schema" {
     try testing.expectError(error.UnsupportedEndianness, decode(testing.allocator, buf));
 }
 
-test "decode rejects a timestamp with a timezone" {
+test "temporal types round-trip, including zoned timestamps" {
+    const allocator = testing.allocator;
+
+    var zoned = try DataType.initTimestamp(allocator, .microsecond, "Europe/Paris");
+    defer zoned.deinit(allocator);
+
+    var fields: [6]Field = undefined;
+    var built: usize = 0;
+    defer for (fields[0..built]) |*f| f.deinit(allocator);
+    fields[0] = try Field.init(allocator, "t32s", .{ .time32 = .second }, true);
+    built += 1;
+    fields[1] = try Field.init(allocator, "t32m", .{ .time32 = .millisecond }, true);
+    built += 1;
+    fields[2] = try Field.init(allocator, "t64u", .{ .time64 = .microsecond }, true);
+    built += 1;
+    fields[3] = try Field.init(allocator, "dur", .{ .duration = .nanosecond }, false);
+    built += 1;
+    fields[4] = try Field.init(allocator, "zoned", zoned, true);
+    built += 1;
+    fields[5] = try Field.init(allocator, "naive", .{ .timestamp = .{ .unit = .second } }, true);
+    built += 1;
+    var schema = try Schema.init(allocator, fields[0..]);
+    defer schema.deinit(allocator);
+
+    const bytes = try encode(allocator, schema);
+    defer allocator.free(bytes);
+    var back = try decode(allocator, bytes);
+    defer back.deinit(allocator);
+
+    try testing.expect(schema.equals(back));
+    try testing.expectEqualStrings("Europe/Paris", back.field(4).data_type.timestamp.timezone.?);
+    try testing.expect(back.field(5).data_type.timestamp.timezone == null);
+}
+
+test "decimal and fixed-size types round-trip" {
+    const allocator = testing.allocator;
+
+    var points = try DataType.initFixedSizeList(allocator, .float64, 2);
+    defer points.deinit(allocator);
+
+    var fields: [4]Field = undefined;
+    var built: usize = 0;
+    defer for (fields[0..built]) |*f| f.deinit(allocator);
+    fields[0] = try Field.init(allocator, "price", .{ .decimal128 = .{ .precision = 19, .scale = 4 } }, true);
+    built += 1;
+    fields[1] = try Field.init(allocator, "huge", .{ .decimal256 = .{ .precision = 76, .scale = 10 } }, true);
+    built += 1;
+    fields[2] = try Field.init(allocator, "uuid", .{ .fixed_size_binary = 16 }, false);
+    built += 1;
+    fields[3] = try Field.init(allocator, "pair", points, true);
+    built += 1;
+    var schema = try Schema.init(allocator, fields[0..]);
+    defer schema.deinit(allocator);
+
+    const bytes = try encode(allocator, schema);
+    defer allocator.free(bytes);
+    var back = try decode(allocator, bytes);
+    defer back.deinit(allocator);
+
+    try testing.expect(schema.equals(back));
+    try testing.expectEqual(@as(i32, 2), back.field(3).data_type.fixed_size_list.size);
+    try testing.expectEqualStrings("item", back.field(3).data_type.fixed_size_list.child.name);
+}
+
+test "dictionary-encoded fields round-trip" {
+    const allocator = testing.allocator;
+
+    var dict_type = try DataType.initDictionary(allocator, 7, .int16, .utf8, true);
+    defer dict_type.deinit(allocator);
+    var category = try Field.init(allocator, "category", dict_type, true);
+    defer category.deinit(allocator);
+    var schema = try Schema.init(allocator, &.{category});
+    defer schema.deinit(allocator);
+
+    const bytes = try encode(allocator, schema);
+    defer allocator.free(bytes);
+    var back = try decode(allocator, bytes);
+    defer back.deinit(allocator);
+
+    try testing.expect(schema.equals(back));
+    const d = back.field(0).data_type.dictionary;
+    try testing.expectEqual(@as(i64, 7), d.id);
+    try testing.expect(d.index.equals(.int16));
+    try testing.expect(d.value.equals(.utf8));
+    try testing.expect(d.ordered);
+}
+
+test "decode rejects a decimal whose precision exceeds its width" {
     var b = Builder.init(testing.allocator);
     defer b.deinit();
 
-    const tz = try b.createString("UTC");
+    // 39 digits do not fit in 128 bits.
     b.startTable();
-    try b.addScalar(i16, 0, 2, 0); // TimeUnit.MICROSECOND
-    try b.addOffset(1, tz);
-    const ts_type = try b.endTable();
+    try b.addScalar(i32, 0, 39, 0);
+    try b.addScalar(i32, 1, 2, 0);
+    const decimal_type = try b.endTable();
 
-    const field_name = try b.createString("ts");
+    const field_name = try b.createString("price");
     b.startTable();
     try b.addOffset(0, field_name);
-    try b.addScalar(bool, 1, true, false);
-    try b.addScalar(u8, 2, 10, 0); // Type.Timestamp
-    try b.addOffset(3, ts_type);
+    try b.addScalar(u8, 2, 7, 0); // Type.Decimal
+    try b.addOffset(3, decimal_type);
     const field_off = try b.endTable();
 
     try b.startVector(4, 1, 4);
@@ -527,24 +821,52 @@ test "decode rejects a timestamp with a timezone" {
     const root = try b.endTable();
     const buf = try b.finish(root);
 
-    try testing.expectError(error.UnsupportedType, decode(testing.allocator, buf));
+    try testing.expectError(error.MalformedSchema, decode(testing.allocator, buf));
+}
+
+test "decode rejects a time whose unit and width disagree" {
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+
+    // A 64-bit time with the SECOND unit, which the spec does not pair.
+    b.startTable();
+    try b.addScalar(i16, 0, 0, 1);
+    try b.addScalar(i32, 1, 64, 32);
+    const time_type = try b.endTable();
+
+    const field_name = try b.createString("t");
+    b.startTable();
+    try b.addOffset(0, field_name);
+    try b.addScalar(u8, 2, 9, 0); // Type.Time
+    try b.addOffset(3, time_type);
+    const field_off = try b.endTable();
+
+    try b.startVector(4, 1, 4);
+    try b.pushOffsetElement(field_off);
+    const fields_off = try b.endVector(1);
+
+    b.startTable();
+    try b.addOffset(1, fields_off);
+    const root = try b.endTable();
+    const buf = try b.finish(root);
+
+    try testing.expectError(error.MalformedSchema, decode(testing.allocator, buf));
 }
 
 test "decode rejects a type Zarr does not implement" {
     var b = Builder.init(testing.allocator);
     defer b.deinit();
 
-    // A Decimal type table: precision 10, scale 2.
+    // An Interval type table: unit YEAR_MONTH.
     b.startTable();
-    try b.addScalar(i32, 0, 10, 0);
-    try b.addScalar(i32, 1, 2, 0);
-    const decimal_type = try b.endTable();
+    try b.addScalar(i16, 0, 0, 0);
+    const interval_type = try b.endTable();
 
-    const field_name = try b.createString("price");
+    const field_name = try b.createString("span");
     b.startTable();
     try b.addOffset(0, field_name);
-    try b.addScalar(u8, 2, 7, 0); // Type.Decimal
-    try b.addOffset(3, decimal_type);
+    try b.addScalar(u8, 2, 11, 0); // Type.Interval
+    try b.addOffset(3, interval_type);
     const field_off = try b.endTable();
 
     try b.startVector(4, 1, 4);

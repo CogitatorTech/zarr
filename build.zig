@@ -41,6 +41,84 @@ pub fn build(b: *std.Build) void {
     const c_api_test_step = b.step("test-c-api", "Run C Data Interface library tests");
     c_api_test_step.dependOn(&run_c_api_tests.step);
 
+    // Fuzz-regression corpus check over the optional arrow-testing submodule,
+    // run on demand via `zig build corpus-check`. The tool skips and exits
+    // zero when the submodule is not initialized.
+    const corpus_module = b.createModule(.{
+        .root_source_file = b.path("tools/ipc_corpus_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    corpus_module.addImport("zarr", zarr_module);
+    const corpus_exe = b.addExecutable(.{
+        .name = "ipc-corpus-check",
+        .root_module = corpus_module,
+    });
+    const run_corpus = b.addRunArtifact(corpus_exe);
+    run_corpus.setCwd(b.path("."));
+    const corpus_step = b.step("corpus-check", "Run the arrow-testing IPC fuzz corpus through the IPC readers");
+    corpus_step.dependOn(&run_corpus.step);
+
+    // Golden-file check against the Arrow integration data in the optional
+    // arrow-testing submodule, run on demand via `zig build golden-check`.
+    // The tool skips and exits zero when the submodule is not initialized.
+    const golden_module = b.createModule(.{
+        .root_source_file = b.path("tools/golden_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    golden_module.addImport("zarr", zarr_module);
+    const golden_exe = b.addExecutable(.{
+        .name = "golden-check",
+        .root_module = golden_module,
+    });
+    const run_golden = b.addRunArtifact(golden_exe);
+    run_golden.setCwd(b.path("."));
+    const golden_step = b.step("golden-check", "Verify the Arrow integration golden files against their JSON values");
+    golden_step.dependOn(&run_golden.step);
+
+    // Differential IPC test against nanoarrow, run on demand via
+    // `zig build interop-nanoarrow`. Compiles the vendored nanoarrow sources
+    // from the external/nanoarrow submodule with Zig's C compiler, so no
+    // system packages are needed. The step fails to build when the submodule
+    // is absent; `make interop-nanoarrow` guards for that and skips.
+    const nanoarrow_module = b.createModule(.{
+        .root_source_file = b.path("tools/nanoarrow_differential.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    nanoarrow_module.addImport("zarr", zarr_module);
+    nanoarrow_module.addIncludePath(b.path("tools/nanoarrow_include"));
+    nanoarrow_module.addIncludePath(b.path("external/nanoarrow/src"));
+    nanoarrow_module.addIncludePath(b.path("external/nanoarrow/thirdparty/flatcc/include"));
+    nanoarrow_module.addCSourceFiles(.{
+        .files = &.{
+            "tools/nanoarrow_shim.c",
+            "external/nanoarrow/src/nanoarrow/common/array.c",
+            "external/nanoarrow/src/nanoarrow/common/array_stream.c",
+            "external/nanoarrow/src/nanoarrow/common/schema.c",
+            "external/nanoarrow/src/nanoarrow/common/utils.c",
+            "external/nanoarrow/src/nanoarrow/ipc/codecs.c",
+            "external/nanoarrow/src/nanoarrow/ipc/decoder.c",
+            "external/nanoarrow/src/nanoarrow/ipc/encoder.c",
+            "external/nanoarrow/src/nanoarrow/ipc/reader.c",
+            "external/nanoarrow/src/nanoarrow/ipc/writer.c",
+            "external/nanoarrow/thirdparty/flatcc/src/runtime/builder.c",
+            "external/nanoarrow/thirdparty/flatcc/src/runtime/emitter.c",
+            "external/nanoarrow/thirdparty/flatcc/src/runtime/refmap.c",
+            "external/nanoarrow/thirdparty/flatcc/src/runtime/verifier.c",
+        },
+    });
+    const nanoarrow_exe = b.addExecutable(.{
+        .name = "nanoarrow-differential",
+        .root_module = nanoarrow_module,
+    });
+    const run_nanoarrow = b.addRunArtifact(nanoarrow_exe);
+    run_nanoarrow.setCwd(b.path("."));
+    const nanoarrow_step = b.step("interop-nanoarrow", "Run the differential IPC test against nanoarrow");
+    nanoarrow_step.dependOn(&run_nanoarrow.step);
+
     // Generate API documentation from the library root module (src/lib.zig).
     const docs_step = b.step("docs", "Generate API documentation");
     const install_docs = b.addInstallDirectory(.{

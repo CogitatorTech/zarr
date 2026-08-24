@@ -46,6 +46,9 @@ Priorities, in order:
 - `src/zarr/primitive_array.zig`: `PrimitiveArray`, a fixed-width primitive array and its builder.
 - `src/zarr/ipc/`: the Arrow IPC layer, layered as FlatBuffers runtime, message framing, schema and record batch serialization, and the stream and file formats.
 - `test/interop/`: pyarrow round-trip scripts run by `make interop`; they skip cleanly when pyarrow is absent.
+- `tools/`: development binaries wired through `build.zig`, such as the IPC corpus check; they are not part of the library.
+- `external/`: optional git submodules for differential testing (arrow-testing and nanoarrow). Nothing under `src/` may import them, and every
+  target that needs them skips cleanly when they are not initialized (`git submodule update --init`), so the library itself stays dependency-free.
 - `build.zig`: module definition, static library artifact, and the `test` and `docs` steps.
 - `build.zig.zon`: package metadata; minimum Zig version 0.16.0.
 - `Makefile`: development workflow wrapper around `zig build`.
@@ -90,9 +93,12 @@ The memory model, the array layer, schema, and record batches are in place, alon
 type round-trips through. The C Data Interface (`src/zarr/c_data.zig`) exports and imports types, fields, arrays, and record batches. IPC is in place under
 `src/zarr/ipc/`: a minimal FlatBuffers runtime, message framing, schema and record batch serialization, and the stream and file formats. Both the C Data
 Interface and IPC are interop-proven against pyarrow in both directions. `make interop` runs the scripts under `test/interop/`, and fixture tests inside the
-IPC modules pin pyarrow-written bytes without a network or Python dependency. Not yet implemented: dictionary batches, body compression, and the spec types
-missing from `DataType`, such as decimal, time, duration, interval, fixed-size layouts, map, and union. Readers report these as unsupported errors instead of
-guessing.
+IPC modules pin pyarrow-written bytes without a network or Python dependency. Not yet implemented: dictionary deltas, body compression, and the spec types
+missing from `DataType`: interval, map, union, and the view layouts. Readers report these as unsupported errors instead of guessing.
+Temporal coverage is complete (date, time, duration, and timestamps with or without a timezone), and so are decimals and the fixed-size layouts.
+Dictionary-encoded data flows both ways over IPC and the C Data Interface: IPC readers collect dictionary batches and attach values to columns,
+IPC writers emit each dictionary once before the first batch that uses it, and the C interface carries indices with a dictionary child, assigning
+fresh ids on import since the C ABI has none.
 
 ## Zig Conventions
 
@@ -113,6 +119,9 @@ Run the narrowest relevant checks, then expand if the change is wide.
 | Formatting | `zig fmt --check src build.zig build.zig.zon` | Any code change                        |
 | Build      | `make build`                                  | `build.zig` or `build.zig.zon` changed |
 | Docs       | `make docs`                                   | Public API doc comments changed        |
+| Corpus     | `make corpus`                                 | IPC decode paths changed (optional; skips without the arrow-testing submodule) |
+| Differential | `make interop-nanoarrow`                    | IPC read or write paths changed (optional; skips without the nanoarrow submodule) |
+| Golden     | `make golden`                                 | IPC decode paths or `DataType` changed (optional; skips without the arrow-testing submodule) |
 
 Minimum expectations:
 

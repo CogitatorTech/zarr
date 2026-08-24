@@ -17,23 +17,27 @@
 //! - `name`: `utf8`, `["a", null, "ccc"]` (32-bit-offset variable length).
 //! - `bio`: `large_utf8`, `["x", "yy", "zzz"]` (64-bit-offset variable length).
 //! - `tags`: `list<int32>`, `[[1, 2], [], [3, 4, 5]]` (nested offsets and child).
+//! - `point`: `struct<x: float64 not null, label: utf8>`,
+//!   `[{1.5, "a"}, null, {-2.25, null}]` (named fields, a struct-level null,
+//!   and a child-level null under a valid row).
 //!
-//! Timestamp and struct columns are left out on purpose: a batch builder always
-//! stamps a primitive column with its storage type, so a `timestamp` logical
-//! type cannot ride through it, and a struct `DataType` carries no field names,
-//! so a struct column's inner fields would export unnamed.
+//! A timestamp column is left out on purpose: a batch builder always stamps a
+//! primitive column with its storage type, so a `timestamp` logical type
+//! cannot ride through it.
 
 const std = @import("std");
 const zarr = @import("zarr");
 
 const ArrowSchema = zarr.c_data.ArrowSchema;
 const ArrowArray = zarr.c_data.ArrowArray;
+const PointColumn = zarr.StructArray(&.{ zarr.PrimitiveArray(f64), zarr.Utf8Array });
 const SampleBatch = zarr.RecordBatch(&[_]type{
     zarr.PrimitiveArray(i32),
     zarr.BooleanArray,
     zarr.Utf8Array,
     zarr.LargeUtf8Array,
     zarr.ListArray(zarr.PrimitiveArray(i32)),
+    PointColumn,
 });
 
 /// The allocator backing every export. It is captured in the exported release
@@ -47,6 +51,8 @@ const expected_flags = [row_count]?bool{ true, null, false };
 const expected_names = [row_count]?[]const u8{ "a", null, "ccc" };
 const expected_bios = [row_count][]const u8{ "x", "yy", "zzz" };
 const expected_tags = [row_count][]const i32{ &.{ 1, 2 }, &.{}, &.{ 3, 4, 5 } };
+const Point = struct { x: f64, label: ?[]const u8 };
+const expected_points = [row_count]?Point{ .{ .x = 1.5, .label = "a" }, null, .{ .x = -2.25, .label = null } };
 
 /// Fill the caller-allocated `ArrowSchema` and `ArrowArray` at the given
 /// addresses with the sample record batch. Returns 0 on success, 1 on failure.
@@ -182,6 +188,110 @@ fn verifySampleFile(bytes: []const u8) !bool {
     return batchMatchesSample(batch);
 }
 
+/// Import the `ArrowSchema` and `ArrowArray` at the given addresses, release
+/// them, and check the batch equals rows 1 and 2 of the sample, which is what
+/// slicing the sample batch as `[1:3]` produces. Verifies that a producer's
+/// non-zero offset is honored on import. Returns 0 on a match, 1 on a
+/// mismatch, and 2 when the import itself fails.
+export fn zarr_verify_sample_batch_slice(schema_addr: usize, array_addr: usize) c_int {
+    const in_schema: *ArrowSchema = @ptrFromInt(schema_addr);
+    const in_array: *ArrowArray = @ptrFromInt(array_addr);
+
+    var batch = zarr.c_data.importRecordBatch(SampleBatch, allocator, in_schema, in_array) catch {
+        releaseBoth(in_schema, in_array);
+        return 2;
+    };
+    defer batch.deinit();
+    releaseBoth(in_schema, in_array);
+
+    return if (batchMatchesSampleRows(batch, 1, 2)) 0 else 1;
+}
+
+/// Fill the caller-allocated structs with a dictionary-encoded column:
+/// indices [0, 1, null, 2, 0] (int8) into ["red", "green", "blue"]. Returns 0
+/// on success, 1 on failure.
+export fn zarr_export_dict_column(schema_addr: usize, array_addr: usize) c_int {
+    const out_schema: *ArrowSchema = @ptrFromInt(schema_addr);
+    const out_array: *ArrowArray = @ptrFromInt(array_addr);
+    exportDictColumn(out_schema, out_array) catch return 1;
+    return 0;
+}
+
+fn exportDictColumn(out_schema: *ArrowSchema, out_array: *ArrowArray) !void {
+    var dict_type = try zarr.DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    defer dict_type.deinit(allocator);
+    try zarr.c_data.exportSchema(allocator, dict_type, out_schema);
+    errdefer out_schema.release.?(out_schema);
+    const data = try buildDictData();
+    try zarr.c_data.exportArray(allocator, data, out_array);
+}
+
+fn buildDictData() !zarr.ArrayData {
+    const Buffer = zarr.Buffer;
+    var offsets = try Buffer.alloc(allocator, 4 * @sizeOf(i32));
+    const off = offsets.items(i32);
+    off[0] = 0;
+    off[1] = 3;
+    off[2] = 8;
+    off[3] = 12;
+    const values = try Buffer.dupe(allocator, "redgreenblue");
+    const dict_buffers = try allocator.alloc(?Buffer, 3);
+    dict_buffers[0] = null;
+    dict_buffers[1] = offsets;
+    dict_buffers[2] = values;
+    const dict_values = try zarr.ArrayData.init(allocator, .utf8, 3, 0, dict_buffers, try allocator.alloc(zarr.ArrayData, 0));
+
+    var indices = try Buffer.alloc(allocator, 5);
+    const idx = indices.items(i8);
+    idx[0] = 0;
+    idx[1] = 1;
+    idx[2] = 0;
+    idx[3] = 2;
+    idx[4] = 0;
+    var validity = try Buffer.allocZeroed(allocator, 1);
+    validity.data[0] = 0b11011;
+    const buffers = try allocator.alloc(?Buffer, 2);
+    buffers[0] = validity;
+    buffers[1] = indices;
+    const dict_type = try zarr.DataType.initDictionary(allocator, 0, .int8, .utf8, false);
+    return zarr.ArrayData.initDictionary(allocator, dict_type, 5, 1, buffers, dict_values);
+}
+
+/// Import the structs at the given addresses, release them, and check the
+/// column equals the dictionary sample above. Returns 0 on a match, 1 on a
+/// mismatch, and 2 when the import itself fails.
+export fn zarr_verify_dict_column(schema_addr: usize, array_addr: usize) c_int {
+    const in_schema: *ArrowSchema = @ptrFromInt(schema_addr);
+    const in_array: *ArrowArray = @ptrFromInt(array_addr);
+    const matched = verifyDictColumn(in_schema, in_array) catch {
+        releaseBoth(in_schema, in_array);
+        return 2;
+    };
+    releaseBoth(in_schema, in_array);
+    return if (matched) 0 else 1;
+}
+
+fn verifyDictColumn(in_schema: *const ArrowSchema, in_array: *const ArrowArray) !bool {
+    var dt = try zarr.c_data.importSchema(allocator, in_schema);
+    defer dt.deinit(allocator);
+    if (dt != .dictionary) return false;
+    if (!dt.dictionary.index.equals(.int8) or !dt.dictionary.value.equals(.utf8)) return false;
+
+    var data = try zarr.c_data.importArray(allocator, dt, in_array);
+    defer data.deinit();
+    if (data.length != 5) return false;
+    // Element 2 is null; its index byte is undefined and not compared.
+    const idx = data.values(i8);
+    if (idx[0] != 0 or idx[1] != 1 or idx[3] != 2 or idx[4] != 0) return false;
+    if (data.isValid(2) or !data.isValid(0) or !data.isValid(4)) return false;
+    const dict = data.dictionary.?;
+    if (dict.length != 3) return false;
+    if (!std.mem.eql(u8, dict.valueBytes(0), "red")) return false;
+    if (!std.mem.eql(u8, dict.valueBytes(1), "green")) return false;
+    if (!std.mem.eql(u8, dict.valueBytes(2), "blue")) return false;
+    return true;
+}
+
 fn releaseBoth(schema: *ArrowSchema, array: *ArrowArray) void {
     if (array.release) |release| release(array);
     if (schema.release) |release| release(schema);
@@ -199,7 +309,14 @@ fn buildSchema() !zarr.Schema {
     var list_type = try zarr.DataType.initList(allocator, .int32);
     defer list_type.deinit(allocator);
 
-    var fields: [5]zarr.Field = undefined;
+    var x = try zarr.Field.init(allocator, "x", .float64, false);
+    defer x.deinit(allocator);
+    var label = try zarr.Field.init(allocator, "label", .utf8, true);
+    defer label.deinit(allocator);
+    var point_type = try zarr.DataType.initStructFields(allocator, &.{ x, label });
+    defer point_type.deinit(allocator);
+
+    var fields: [6]zarr.Field = undefined;
     var built: usize = 0;
     defer for (fields[0..built]) |*f| f.deinit(allocator);
     fields[0] = try zarr.Field.init(allocator, "id", .int32, false);
@@ -211,6 +328,8 @@ fn buildSchema() !zarr.Schema {
     fields[3] = try zarr.Field.init(allocator, "bio", .large_utf8, false);
     built += 1;
     fields[4] = try zarr.Field.init(allocator, "tags", list_type, false);
+    built += 1;
+    fields[5] = try zarr.Field.init(allocator, "point", point_type, true);
     built += 1;
 
     return zarr.Schema.init(allocator, fields[0..]);
@@ -226,6 +345,13 @@ fn buildBatch(schema: zarr.Schema) !SampleBatch {
         try builder.children[3].append(expected_bios[i]);
         for (expected_tags[i]) |element| try builder.children[4].values.append(element);
         try builder.children[4].appendList();
+        if (expected_points[i]) |p| {
+            try builder.children[5].children[0].append(p.x);
+            if (p.label) |v| try builder.children[5].children[1].append(v) else try builder.children[5].children[1].appendNull();
+            try builder.children[5].append();
+        } else {
+            try builder.children[5].appendNull();
+        }
         try builder.append();
     }
     var columns = try builder.finish();
@@ -234,21 +360,35 @@ fn buildBatch(schema: zarr.Schema) !SampleBatch {
 }
 
 fn batchMatchesSample(batch: SampleBatch) bool {
-    if (batch.numRows() != row_count) return false;
+    return batchMatchesSampleRows(batch, 0, row_count);
+}
+
+/// Whether `batch` holds exactly rows `[start, start + count)` of the sample.
+fn batchMatchesSampleRows(batch: SampleBatch, start: usize, count: usize) bool {
+    if (batch.numRows() != count) return false;
     const ids = batch.column(0);
     const flags = batch.column(1);
     const names = batch.column(2);
     const bios = batch.column(3);
     const tags = batch.column(4);
-    for (0..row_count) |i| {
-        if (ids.get(i) != @as(?i32, expected_ids[i])) return false;
-        if (!optBoolEq(flags.get(i), expected_flags[i])) return false;
-        if (!optBytesEq(names.get(i), expected_names[i])) return false;
-        if (!optBytesEq(bios.get(i), expected_bios[i])) return false;
-        if (tags.valueLength(i) != expected_tags[i].len) return false;
-        const base = tags.valueOffset(i);
-        for (expected_tags[i], 0..) |element, j| {
-            if (tags.values.get(base + j) != @as(?i32, element)) return false;
+    const points = batch.column(5);
+    for (0..count) |j| {
+        const i = start + j;
+        if (ids.get(j) != @as(?i32, expected_ids[i])) return false;
+        if (!optBoolEq(flags.get(j), expected_flags[i])) return false;
+        if (!optBytesEq(names.get(j), expected_names[i])) return false;
+        if (!optBytesEq(bios.get(j), expected_bios[i])) return false;
+        if (tags.valueLength(j) != expected_tags[i].len) return false;
+        const base = tags.valueOffset(j);
+        for (expected_tags[i], 0..) |element, k| {
+            if (tags.values.get(base + k) != @as(?i32, element)) return false;
+        }
+        if (expected_points[i]) |p| {
+            if (!points.isValid(j)) return false;
+            if (points.field(0).get(j) != @as(?f64, p.x)) return false;
+            if (!optBytesEq(points.field(1).get(j), p.label)) return false;
+        } else if (points.isValid(j)) {
+            return false;
         }
     }
     return true;
@@ -278,6 +418,26 @@ test "sample file round-trips through the C API entry points" {
     const written = zarr_encode_sample_file(@intFromPtr(&buf), buf.len);
     try std.testing.expect(written > 0);
     try std.testing.expectEqual(@as(c_int, 0), zarr_verify_sample_file(@intFromPtr(&buf), @intCast(written)));
+}
+
+test "a sliced sample batch verifies through the C API entry points" {
+    // Export fills the structs, then a foreign-style slice is simulated by
+    // moving the root offset, exactly as a producer that hands over rows
+    // [1, 3) would.
+    var schema: ArrowSchema = undefined;
+    var array: ArrowArray = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), zarr_export_sample_batch(@intFromPtr(&schema), @intFromPtr(&array)));
+    array.offset = 1;
+    array.length = 2;
+    array.null_count = -1;
+    try std.testing.expectEqual(@as(c_int, 0), zarr_verify_sample_batch_slice(@intFromPtr(&schema), @intFromPtr(&array)));
+}
+
+test "the dictionary column round-trips through the C API entry points" {
+    var schema: ArrowSchema = undefined;
+    var array: ArrowArray = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), zarr_export_dict_column(@intFromPtr(&schema), @intFromPtr(&array)));
+    try std.testing.expectEqual(@as(c_int, 0), zarr_verify_dict_column(@intFromPtr(&schema), @intFromPtr(&array)));
 }
 
 test "sample batch round-trips through the C API entry points" {

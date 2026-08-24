@@ -31,7 +31,8 @@ EXPECTED_FLAGS = [True, None, False]
 EXPECTED_NAMES = ["a", None, "ccc"]
 EXPECTED_BIOS = ["x", "yy", "zzz"]
 EXPECTED_TAGS = [[1, 2], [], [3, 4, 5]]
-COLUMN_NAMES = ["id", "flag", "name", "bio", "tags"]
+EXPECTED_POINTS = [{"x": 1.5, "label": "a"}, None, {"x": -2.25, "label": None}]
+COLUMN_NAMES = ["id", "flag", "name", "bio", "tags", "point"]
 
 
 def build_reference():
@@ -42,6 +43,7 @@ def build_reference():
             pa.array(EXPECTED_NAMES, type=pa.utf8()),
             pa.array(EXPECTED_BIOS, type=pa.large_utf8()),
             pa.array(EXPECTED_TAGS, type=pa.list_(pa.int32())),
+            pa.array(EXPECTED_POINTS, type=pa.struct([pa.field("x", pa.float64(), nullable=False), pa.field("label", pa.utf8())])),
         ],
         names=COLUMN_NAMES,
     )
@@ -74,6 +76,12 @@ def main():
     lib.zarr_export_sample_batch.restype = ctypes.c_int
     lib.zarr_verify_sample_batch.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
     lib.zarr_verify_sample_batch.restype = ctypes.c_int
+    lib.zarr_verify_sample_batch_slice.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
+    lib.zarr_verify_sample_batch_slice.restype = ctypes.c_int
+    lib.zarr_export_dict_column.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
+    lib.zarr_export_dict_column.restype = ctypes.c_int
+    lib.zarr_verify_dict_column.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
+    lib.zarr_verify_dict_column.restype = ctypes.c_int
 
     # Compare by value, not by full schema equality: field names on nested
     # children and nullability metadata are not what this test asserts.
@@ -83,6 +91,7 @@ def main():
         EXPECTED_NAMES,
         EXPECTED_BIOS,
         EXPECTED_TAGS,
+        EXPECTED_POINTS,
     ]
 
     # Direction 1: Zarr exports, pyarrow imports.
@@ -105,6 +114,38 @@ def main():
     rc = lib.zarr_verify_sample_batch(addr(c_schema2), addr(c_array2))
     assert rc == 0, f"zarr_verify_sample_batch returned {rc}"
     print("PASS: pyarrow export -> Zarr import")
+
+    # Direction 3: pyarrow exports a slice, which arrives with a non-zero
+    # offset; Zarr must honor it on import.
+    sliced = build_reference().slice(1, 2)
+    c_schema3 = ffi.new("struct ArrowSchema*")
+    c_array3 = ffi.new("struct ArrowArray*")
+    sliced._export_to_c(addr(c_array3), addr(c_schema3))
+    rc = lib.zarr_verify_sample_batch_slice(addr(c_schema3), addr(c_array3))
+    assert rc == 0, f"zarr_verify_sample_batch_slice returned {rc}"
+    print("PASS: pyarrow sliced export -> Zarr import")
+
+    # Direction 4: Zarr exports a dictionary-encoded column, pyarrow decodes it.
+    c_schema4 = ffi.new("struct ArrowSchema*")
+    c_array4 = ffi.new("struct ArrowArray*")
+    rc = lib.zarr_export_dict_column(addr(c_schema4), addr(c_array4))
+    assert rc == 0, f"zarr_export_dict_column returned {rc}"
+    dict_col = pa.Array._import_from_c(addr(c_array4), addr(c_schema4))
+    assert dict_col.type == pa.dictionary(pa.int8(), pa.utf8()), dict_col.type
+    assert dict_col.to_pylist() == ["red", "green", None, "blue", "red"], dict_col.to_pylist()
+    print("PASS: Zarr dictionary export -> pyarrow import")
+
+    # Direction 5: pyarrow exports a dictionary-encoded column, Zarr verifies it.
+    dict_out = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, None, 2, 0], type=pa.int8()),
+        pa.array(["red", "green", "blue"]),
+    )
+    c_schema5 = ffi.new("struct ArrowSchema*")
+    c_array5 = ffi.new("struct ArrowArray*")
+    dict_out._export_to_c(addr(c_array5), addr(c_schema5))
+    rc = lib.zarr_verify_dict_column(addr(c_schema5), addr(c_array5))
+    assert rc == 0, f"zarr_verify_dict_column returned {rc}"
+    print("PASS: pyarrow dictionary export -> Zarr import")
 
     print(f"OK: C Data Interface round-trip verified against pyarrow {pa.__version__}")
     return 0
